@@ -1,0 +1,25 @@
+{
+  "manifest_version": 3,
+  "name": "Script Scroll",
+  "version": "1.0.0",
+  "description": "Live caption reader for Netflix and Peacock — displays subtitles in a dev overlay",
+  "permissions": ["activeTab", "storage"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://www.netflix.com/*", "https://www.peacocktv.com/*"],
+      "js": ["content.js"],
+      "css": ["styles.css"],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_title": "Script Scroll"
+  },
+  "icons": {
+    "48": "icon48.png",
+    "128": "icon128.png"
+  }
+}
