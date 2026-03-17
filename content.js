@@ -11,7 +11,25 @@
   let captionObserver = null;
   let lastCaption = "";
   let fullScriptLoaded = false;
-  let cueLineMap = new Map(); // Maps cue text → DOM element
+  let allLines = []; // { startTime, endTime, text, el }
+
+  // ==========================================================
+  // Inject Fetch Interceptor into Page World
+  // ==========================================================
+
+  function injectInterceptor() {
+    const script = document.createElement("script");
+    script.src = chrome.runtime.getURL("interceptor.js");
+    script.onload = () => script.remove();
+    (document.head || document.documentElement).appendChild(script);
+  }
+
+  // Listen for intercepted subtitle data from page world
+  window.addEventListener("message", (event) => {
+    if (event.data?.type !== "ss:subtitles-intercepted") return;
+    if (fullScriptLoaded) return; // Already have a script loaded
+    parseTTML(event.data.data);
+  });
 
   // ==========================================================
   // UI Creation — Script Panel (right side)
@@ -29,7 +47,7 @@
 
   const scriptWaiting = document.createElement("div");
   scriptWaiting.id = "ss-waiting";
-  scriptWaiting.textContent = "Waiting for captions…";
+  scriptWaiting.textContent = "Waiting for subtitles…\nMake sure captions are enabled.";
 
   scriptBody.appendChild(scriptWaiting);
   scriptPanel.appendChild(scriptHeader);
@@ -43,113 +61,154 @@
   scriptPanel.style.display = "none";
 
   // ==========================================================
+  // TTML Parser
+  // ==========================================================
+
+  function parseTTML(xmlString) {
+    const parser = new DOMParser();
+    const doc = parser.parseFromString(xmlString, "text/xml");
+
+    // Find all <p> elements (each is a subtitle cue)
+    const pEls = doc.querySelectorAll("p");
+    if (pEls.length < 5) return; // Not a real subtitle file
+
+    const cues = [];
+    pEls.forEach(p => {
+      const begin = p.getAttribute("begin");
+      const end = p.getAttribute("end");
+      // Get text content, stripping inner tags like <span>, <br>
+      const text = p.textContent?.replace(/\s+/g, " ").trim();
+      if (!text || !begin) return;
+
+      cues.push({
+        startTime: parseTimestamp(begin),
+        endTime: end ? parseTimestamp(end) : null,
+        text: text,
+      });
+    });
+
+    if (cues.length < 5) return;
+
+    renderFullScript(cues);
+  }
+
+  function parseTimestamp(ts) {
+    // Handle formats like "00:01:23.456" or tick-based
+    if (ts.includes(":")) {
+      const parts = ts.split(":");
+      if (parts.length === 3) {
+        const h = parseFloat(parts[0]);
+        const m = parseFloat(parts[1]);
+        const s = parseFloat(parts[2]);
+        return h * 3600 + m * 60 + s;
+      }
+    }
+    // Tick-based format (ticks / 10000000)
+    const tickMatch = ts.match(/^(\d+)t$/);
+    if (tickMatch) return parseInt(tickMatch[1]) / 10000000;
+    return parseFloat(ts) || 0;
+  }
+
+  // ==========================================================
   // Full Script Rendering
   // ==========================================================
 
   function renderFullScript(cues) {
     scriptBody.innerHTML = "";
-    cueLineMap.clear();
+    allLines = [];
     fullScriptLoaded = true;
 
-    for (let i = 0; i < cues.length; i++) {
-      const cue = cues[i];
-      const text = cue.text?.replace(/<[^>]*>/g, "").trim();
-      if (!text) continue;
+    // Deduplicate consecutive identical lines
+    let prevText = "";
+    cues.forEach(cue => {
+      if (cue.text === prevText) return;
+      prevText = cue.text;
 
       const line = document.createElement("div");
       line.className = "ss-line";
-      line.textContent = text;
-      line.dataset.startTime = cue.startTime;
-      line.dataset.endTime = cue.endTime;
+      line.textContent = cue.text;
+
       scriptBody.appendChild(line);
+      allLines.push({
+        startTime: cue.startTime,
+        endTime: cue.endTime,
+        text: cue.text,
+        el: line,
+      });
+    });
 
-      // Map by start time for precise matching
-      cueLineMap.set(cue.startTime, line);
-    }
+    scriptHeader.textContent = `SCRIPT SCROLL — ${allLines.length} lines`;
 
-    scriptHeader.textContent = `SCRIPT SCROLL — ${cues.length} lines`;
-  }
-
-  function highlightActiveCue(startTime) {
-    const activeLine = cueLineMap.get(startTime);
-    if (!activeLine) return;
-
-    // Remove previous highlight
-    const prev = scriptBody.querySelector(".ss-line-active");
-    if (prev) prev.classList.remove("ss-line-active");
-
-    // Highlight current
-    activeLine.classList.add("ss-line-active");
-
-    // Smooth scroll to keep active line centered
-    activeLine.scrollIntoView({ behavior: "smooth", block: "center" });
+    // Start syncing with video time
+    startTimeSync();
   }
 
   // ==========================================================
-  // Realtime Fallback (append as they come)
+  // Time Sync — Highlight Current Line
   // ==========================================================
 
-  function pushCaption(captionText) {
-    if (!captionText || captionText === lastCaption) return;
-    lastCaption = captionText;
+  let syncRaf = null;
 
-    // If full script is loaded, just highlight the matching line
-    if (fullScriptLoaded) {
-      // Find by text content match
-      const lines = scriptBody.querySelectorAll(".ss-line");
-      for (const line of lines) {
-        if (line.textContent === captionText && !line.classList.contains("ss-line-past")) {
-          const prev = scriptBody.querySelector(".ss-line-active");
-          if (prev) {
-            prev.classList.remove("ss-line-active");
-            prev.classList.add("ss-line-past");
+  function startTimeSync() {
+    if (syncRaf) cancelAnimationFrame(syncRaf);
+
+    function tick() {
+      if (!enabled || !fullScriptLoaded) return;
+
+      const video = document.querySelector("video");
+      if (video) {
+        const currentTime = video.currentTime;
+        let activeIdx = -1;
+
+        // Find the line that matches current time
+        for (let i = allLines.length - 1; i >= 0; i--) {
+          if (currentTime >= allLines[i].startTime) {
+            activeIdx = i;
+            break;
           }
-          line.classList.add("ss-line-active");
-          line.scrollIntoView({ behavior: "smooth", block: "center" });
-          return;
+        }
+
+        if (activeIdx >= 0) {
+          const activeLine = allLines[activeIdx];
+          if (!activeLine.el.classList.contains("ss-line-active")) {
+            // Clear previous active
+            const prev = scriptBody.querySelector(".ss-line-active");
+            if (prev) prev.classList.remove("ss-line-active");
+
+            // Mark all lines before as past
+            allLines.forEach((l, i) => {
+              if (i < activeIdx) l.el.classList.add("ss-line-past");
+              else l.el.classList.remove("ss-line-past");
+            });
+
+            // Highlight current
+            activeLine.el.classList.add("ss-line-active");
+            activeLine.el.scrollIntoView({ behavior: "smooth", block: "center" });
+          }
         }
       }
-      return;
+
+      syncRaf = requestAnimationFrame(tick);
     }
 
-    // Fallback: append in real-time
-    if (scriptWaiting.parentNode) scriptWaiting.remove();
+    syncRaf = requestAnimationFrame(tick);
+  }
 
-    const line = document.createElement("div");
-    line.className = "ss-line ss-line-active";
-
-    // Remove highlight from previous
-    const prev = scriptBody.querySelector(".ss-line-active");
-    if (prev) {
-      prev.classList.remove("ss-line-active");
-      prev.classList.add("ss-line-past");
-    }
-
-    line.textContent = captionText;
-    scriptBody.appendChild(line);
-    line.scrollIntoView({ behavior: "smooth", block: "center" });
-
-    // Cap total lines
-    while (scriptBody.querySelectorAll(".ss-line").length > 500) {
-      const first = scriptBody.querySelector(".ss-line");
-      if (first) first.remove();
+  function stopTimeSync() {
+    if (syncRaf) {
+      cancelAnimationFrame(syncRaf);
+      syncRaf = null;
     }
   }
 
   // ==========================================================
-  // Caption Observer — Dual Strategy
+  // Realtime Fallback (DOM observer for when interception fails)
   // ==========================================================
 
   function startCaptionObserver() {
     if (captionObserver) return;
-
-    scriptBody.innerHTML = "";
-    scriptBody.appendChild(scriptWaiting);
     lastCaption = "";
-    fullScriptLoaded = false;
-    cueLineMap.clear();
 
-    // --- Strategy 1: DOM-based (Netflix renders captions as styled spans) ---
     const findCaptionContainer = () => {
       return document.querySelector(".player-timedtext-text-container")
         || document.querySelector(".player-timedtext")
@@ -157,6 +216,8 @@
     };
 
     const processDomCaptions = () => {
+      if (fullScriptLoaded) return; // Full script takes priority
+
       const container = findCaptionContainer();
       if (!container) return;
 
@@ -167,15 +228,37 @@
         if (t) lines.push(t);
       });
 
-      pushCaption(lines.join(" "));
+      const captionText = lines.join(" ");
+      if (!captionText || captionText === lastCaption) return;
+      lastCaption = captionText;
+
+      // Remove waiting message
+      if (scriptWaiting.parentNode) scriptWaiting.remove();
+
+      // Clear previous active
+      const prev = scriptBody.querySelector(".ss-line-active");
+      if (prev) {
+        prev.classList.remove("ss-line-active");
+        prev.classList.add("ss-line-past");
+      }
+
+      const line = document.createElement("div");
+      line.className = "ss-line ss-line-active";
+      line.textContent = captionText;
+      scriptBody.appendChild(line);
+      line.scrollIntoView({ behavior: "smooth", block: "center" });
+
+      while (scriptBody.querySelectorAll(".ss-line").length > 500) {
+        const first = scriptBody.querySelector(".ss-line");
+        if (first) first.remove();
+      }
     };
 
-    // MutationObserver for DOM-rendered captions
     captionObserver = new MutationObserver(processDomCaptions);
     const target = document.querySelector(".watch-video") || document.querySelector("[class*='player']") || document.body;
     captionObserver.observe(target, { childList: true, subtree: true, characterData: true });
 
-    // --- Strategy 2: TextTrack API ---
+    // TextTrack API fallback
     const hookTextTracks = () => {
       const videos = document.querySelectorAll("video");
       videos.forEach(video => {
@@ -185,31 +268,18 @@
         const tracks = video.textTracks;
         if (!tracks) return;
 
-        const tryDumpFullScript = (track) => {
+        const tryDumpCues = (track) => {
           if (fullScriptLoaded) return;
           if (track.cues && track.cues.length > 10) {
-            renderFullScript(track.cues);
-          }
-        };
-
-        const onCueChange = (track) => {
-          // Try full dump on first cue change if not yet loaded
-          tryDumpFullScript(track);
-
-          if (!track.activeCues || track.activeCues.length === 0) return;
-
-          if (fullScriptLoaded) {
-            // Highlight by start time
-            for (let i = 0; i < track.activeCues.length; i++) {
-              highlightActiveCue(track.activeCues[i].startTime);
+            const cues = [];
+            for (let i = 0; i < track.cues.length; i++) {
+              cues.push({
+                startTime: track.cues[i].startTime,
+                endTime: track.cues[i].endTime,
+                text: track.cues[i].text?.replace(/<[^>]*>/g, "").trim(),
+              });
             }
-          } else {
-            const lines = [];
-            for (let i = 0; i < track.activeCues.length; i++) {
-              const text = track.activeCues[i].text?.replace(/<[^>]*>/g, "").trim();
-              if (text) lines.push(text);
-            }
-            pushCaption(lines.join(" "));
+            renderFullScript(cues);
           }
         };
 
@@ -217,8 +287,7 @@
           const track = tracks[i];
           if (track.kind === "subtitles" || track.kind === "captions") {
             track.mode = "showing";
-            tryDumpFullScript(track);
-            track.addEventListener("cuechange", () => onCueChange(track));
+            tryDumpCues(track);
           }
         }
 
@@ -226,9 +295,7 @@
           const track = e.track;
           if (track.kind === "subtitles" || track.kind === "captions") {
             track.mode = "showing";
-            // Wait a moment for cues to load
-            setTimeout(() => tryDumpFullScript(track), 1000);
-            track.addEventListener("cuechange", () => onCueChange(track));
+            setTimeout(() => tryDumpCues(track), 1000);
           }
         });
       });
@@ -237,7 +304,7 @@
     hookTextTracks();
 
     captionObserver._pollInterval = setInterval(() => {
-      processDomCaptions();
+      if (!fullScriptLoaded) processDomCaptions();
       hookTextTracks();
     }, 500);
   }
@@ -252,7 +319,7 @@
   }
 
   // ==========================================================
-  // Layout — Squeeze Page Left
+  // Layout
   // ==========================================================
 
   function enableSideBySide() {
@@ -266,23 +333,32 @@
   }
 
   // ==========================================================
-  // Lifecycle — Start / Stop
+  // Lifecycle
   // ==========================================================
 
   function startLoop() {
     enabled = true;
+    fullScriptLoaded = false;
+    allLines = [];
+    scriptBody.innerHTML = "";
+    scriptBody.appendChild(scriptWaiting);
+    scriptHeader.textContent = "SCRIPT SCROLL";
     enableSideBySide();
+    injectInterceptor();
     startCaptionObserver();
   }
 
   function stopLoop() {
     enabled = false;
+    fullScriptLoaded = false;
+    allLines = [];
     disableSideBySide();
     stopCaptionObserver();
+    stopTimeSync();
   }
 
   // ==========================================================
-  // Message Listener — Toggle from Background
+  // Message Listener
   // ==========================================================
 
   chrome.runtime.onMessage.addListener((message) => {
