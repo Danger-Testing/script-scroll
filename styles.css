@@ -45,6 +45,7 @@ html.ss-active body {
   flex: 1;
   overflow-y: auto;
   padding: 40px 60px;
+  scroll-behavior: smooth;
 }
 
 /* --- Waiting State --- */
@@ -62,11 +63,27 @@ html.ss-active body {
 .ss-line {
   font-size: 15px;
   line-height: 2;
-  color: #1a1a1a;
+  color: #c0c0b8;
   padding: 2px 0;
-  text-indent: 2em;
+  transition: color 0.3s ease, background 0.3s ease;
+  border-radius: 4px;
 }
 
-.ss-line:first-child {
-  text-indent: 0;
+/* Lines already spoken — dimmed */
+.ss-line-past {
+  color: #b0b0a8;
+}
+
+/* Currently active line — highlighted */
+.ss-line-active {
+  color: #1a1a1a;
+  font-weight: 700;
+  background: rgba(168, 85, 247, 0.08);
+  padding: 2px 8px;
+  margin: 0 -8px;
+}
+
+/* Future lines (not yet spoken) — very faded */
+.ss-line:not(.ss-line-active):not(.ss-line-past) {
+  color: #c0c0b8;
 }

@@ -9,9 +9,9 @@
 
   let enabled = false;
   let captionObserver = null;
-  let captionHistory = [];
-  const MAX_CAPTION_LINES = 200;
   let lastCaption = "";
+  let fullScriptLoaded = false;
+  let cueLineMap = new Map(); // Maps cue text → DOM element
 
   // ==========================================================
   // UI Creation — Script Panel (right side)
@@ -43,28 +43,94 @@
   scriptPanel.style.display = "none";
 
   // ==========================================================
-  // Caption Processing
+  // Full Script Rendering
+  // ==========================================================
+
+  function renderFullScript(cues) {
+    scriptBody.innerHTML = "";
+    cueLineMap.clear();
+    fullScriptLoaded = true;
+
+    for (let i = 0; i < cues.length; i++) {
+      const cue = cues[i];
+      const text = cue.text?.replace(/<[^>]*>/g, "").trim();
+      if (!text) continue;
+
+      const line = document.createElement("div");
+      line.className = "ss-line";
+      line.textContent = text;
+      line.dataset.startTime = cue.startTime;
+      line.dataset.endTime = cue.endTime;
+      scriptBody.appendChild(line);
+
+      // Map by start time for precise matching
+      cueLineMap.set(cue.startTime, line);
+    }
+
+    scriptHeader.textContent = `SCRIPT SCROLL — ${cues.length} lines`;
+  }
+
+  function highlightActiveCue(startTime) {
+    const activeLine = cueLineMap.get(startTime);
+    if (!activeLine) return;
+
+    // Remove previous highlight
+    const prev = scriptBody.querySelector(".ss-line-active");
+    if (prev) prev.classList.remove("ss-line-active");
+
+    // Highlight current
+    activeLine.classList.add("ss-line-active");
+
+    // Smooth scroll to keep active line centered
+    activeLine.scrollIntoView({ behavior: "smooth", block: "center" });
+  }
+
+  // ==========================================================
+  // Realtime Fallback (append as they come)
   // ==========================================================
 
   function pushCaption(captionText) {
     if (!captionText || captionText === lastCaption) return;
     lastCaption = captionText;
 
-    // Remove waiting message on first caption
-    if (scriptWaiting.parentNode) {
-      scriptWaiting.remove();
+    // If full script is loaded, just highlight the matching line
+    if (fullScriptLoaded) {
+      // Find by text content match
+      const lines = scriptBody.querySelectorAll(".ss-line");
+      for (const line of lines) {
+        if (line.textContent === captionText && !line.classList.contains("ss-line-past")) {
+          const prev = scriptBody.querySelector(".ss-line-active");
+          if (prev) {
+            prev.classList.remove("ss-line-active");
+            prev.classList.add("ss-line-past");
+          }
+          line.classList.add("ss-line-active");
+          line.scrollIntoView({ behavior: "smooth", block: "center" });
+          return;
+        }
+      }
+      return;
     }
 
-    captionHistory.push(captionText);
-    if (captionHistory.length > MAX_CAPTION_LINES) captionHistory.shift();
+    // Fallback: append in real-time
+    if (scriptWaiting.parentNode) scriptWaiting.remove();
 
     const line = document.createElement("div");
-    line.className = "ss-line";
+    line.className = "ss-line ss-line-active";
+
+    // Remove highlight from previous
+    const prev = scriptBody.querySelector(".ss-line-active");
+    if (prev) {
+      prev.classList.remove("ss-line-active");
+      prev.classList.add("ss-line-past");
+    }
+
     line.textContent = captionText;
     scriptBody.appendChild(line);
-    scriptBody.scrollTop = scriptBody.scrollHeight;
+    line.scrollIntoView({ behavior: "smooth", block: "center" });
 
-    while (scriptBody.querySelectorAll(".ss-line").length > MAX_CAPTION_LINES) {
+    // Cap total lines
+    while (scriptBody.querySelectorAll(".ss-line").length > 500) {
       const first = scriptBody.querySelector(".ss-line");
       if (first) first.remove();
     }
@@ -77,10 +143,11 @@
   function startCaptionObserver() {
     if (captionObserver) return;
 
-    captionHistory = [];
     scriptBody.innerHTML = "";
     scriptBody.appendChild(scriptWaiting);
     lastCaption = "";
+    fullScriptLoaded = false;
+    cueLineMap.clear();
 
     // --- Strategy 1: DOM-based (Netflix renders captions as styled spans) ---
     const findCaptionContainer = () => {
@@ -108,7 +175,7 @@
     const target = document.querySelector(".watch-video") || document.querySelector("[class*='player']") || document.body;
     captionObserver.observe(target, { childList: true, subtree: true, characterData: true });
 
-    // --- Strategy 2: TextTrack API (Peacock & most other players use native cues) ---
+    // --- Strategy 2: TextTrack API ---
     const hookTextTracks = () => {
       const videos = document.querySelectorAll("video");
       videos.forEach(video => {
@@ -118,20 +185,39 @@
         const tracks = video.textTracks;
         if (!tracks) return;
 
-        const onCueChange = (track) => {
-          if (!track.activeCues || track.activeCues.length === 0) return;
-          const lines = [];
-          for (let i = 0; i < track.activeCues.length; i++) {
-            const text = track.activeCues[i].text?.replace(/<[^>]*>/g, "").trim();
-            if (text) lines.push(text);
+        const tryDumpFullScript = (track) => {
+          if (fullScriptLoaded) return;
+          if (track.cues && track.cues.length > 10) {
+            renderFullScript(track.cues);
           }
-          pushCaption(lines.join(" "));
+        };
+
+        const onCueChange = (track) => {
+          // Try full dump on first cue change if not yet loaded
+          tryDumpFullScript(track);
+
+          if (!track.activeCues || track.activeCues.length === 0) return;
+
+          if (fullScriptLoaded) {
+            // Highlight by start time
+            for (let i = 0; i < track.activeCues.length; i++) {
+              highlightActiveCue(track.activeCues[i].startTime);
+            }
+          } else {
+            const lines = [];
+            for (let i = 0; i < track.activeCues.length; i++) {
+              const text = track.activeCues[i].text?.replace(/<[^>]*>/g, "").trim();
+              if (text) lines.push(text);
+            }
+            pushCaption(lines.join(" "));
+          }
         };
 
         for (let i = 0; i < tracks.length; i++) {
           const track = tracks[i];
           if (track.kind === "subtitles" || track.kind === "captions") {
             track.mode = "showing";
+            tryDumpFullScript(track);
             track.addEventListener("cuechange", () => onCueChange(track));
           }
         }
@@ -140,6 +226,8 @@
           const track = e.track;
           if (track.kind === "subtitles" || track.kind === "captions") {
             track.mode = "showing";
+            // Wait a moment for cues to load
+            setTimeout(() => tryDumpFullScript(track), 1000);
             track.addEventListener("cuechange", () => onCueChange(track));
           }
         });
