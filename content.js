@@ -10,82 +10,37 @@
   let enabled = false;
   let captionObserver = null;
   let captionHistory = [];
-  const MAX_CAPTION_LINES = 50;
+  const MAX_CAPTION_LINES = 200;
   let lastCaption = "";
-  let devVisible = false;
-  let labelTimeout = null;
 
   // ==========================================================
-  // UI Creation — Dev Toggle Button (top-right)
+  // UI Creation — Script Panel (right side)
   // ==========================================================
 
-  const devBtn = document.createElement("button");
-  devBtn.id = "ss-dev-btn";
-  devBtn.textContent = "SHOW DEV";
+  const scriptPanel = document.createElement("div");
+  scriptPanel.id = "ss-panel";
+
+  const scriptHeader = document.createElement("div");
+  scriptHeader.id = "ss-header";
+  scriptHeader.textContent = "SCRIPT SCROLL";
+
+  const scriptBody = document.createElement("div");
+  scriptBody.id = "ss-body";
+
+  const scriptWaiting = document.createElement("div");
+  scriptWaiting.id = "ss-waiting";
+  scriptWaiting.textContent = "Waiting for captions…";
+
+  scriptBody.appendChild(scriptWaiting);
+  scriptPanel.appendChild(scriptHeader);
+  scriptPanel.appendChild(scriptBody);
 
   // ==========================================================
-  // UI Creation — Caption Overlay (dev view)
+  // Mount
   // ==========================================================
 
-  const captionOverlay = document.createElement("div");
-  captionOverlay.id = "ss-caption-overlay";
-
-  const captionLive = document.createElement("div");
-  captionLive.id = "ss-caption-live";
-  captionLive.textContent = "Waiting for captions…";
-
-  const captionLog = document.createElement("div");
-  captionLog.id = "ss-caption-log";
-
-  captionOverlay.appendChild(captionLive);
-  captionOverlay.appendChild(captionLog);
-
-  // ==========================================================
-  // UI Creation — Label Flash (bottom of screen)
-  // ==========================================================
-
-  const scriptLabel = document.createElement("div");
-  scriptLabel.id = "ss-label";
-
-  // ==========================================================
-  // UI Creation — Copy Image Button
-  // ==========================================================
-
-  const copyImgBtn = document.createElement("button");
-  copyImgBtn.id = "ss-copy-img";
-  copyImgBtn.textContent = "COPY IMAGE TO CLIPBOARD";
-
-  // ==========================================================
-  // Mount All Elements
-  // ==========================================================
-
-  document.documentElement.appendChild(devBtn);
-  document.documentElement.appendChild(captionOverlay);
-  document.documentElement.appendChild(scriptLabel);
-  document.documentElement.appendChild(copyImgBtn);
-
-  // Start hidden
-  devBtn.style.display = "none";
-  captionOverlay.style.display = "none";
-  scriptLabel.style.display = "none";
-  copyImgBtn.style.display = "none";
-
-  // ==========================================================
-  // Label Flash
-  // ==========================================================
-
-  function flashLabel(text) {
-    scriptLabel.textContent = text;
-    scriptLabel.style.display = "block";
-    scriptLabel.style.opacity = "1";
-    copyImgBtn.style.display = "block";
-    if (labelTimeout) clearTimeout(labelTimeout);
-    labelTimeout = setTimeout(() => {
-      scriptLabel.style.opacity = "0";
-      copyImgBtn.style.display = "none";
-      setTimeout(() => { scriptLabel.style.display = "none"; }, 400);
-    }, 3000);
-  }
+  document.documentElement.appendChild(scriptPanel);
+  scriptPanel.style.display = "none";
 
   // ==========================================================
   // Caption Processing
@@ -94,19 +49,24 @@
   function pushCaption(captionText) {
     if (!captionText || captionText === lastCaption) return;
     lastCaption = captionText;
-    captionLive.textContent = captionText;
+
+    // Remove waiting message on first caption
+    if (scriptWaiting.parentNode) {
+      scriptWaiting.remove();
+    }
 
     captionHistory.push(captionText);
     if (captionHistory.length > MAX_CAPTION_LINES) captionHistory.shift();
 
     const line = document.createElement("div");
-    line.className = "ss-caption-line";
+    line.className = "ss-line";
     line.textContent = captionText;
-    captionLog.appendChild(line);
-    captionLog.scrollTop = captionLog.scrollHeight;
+    scriptBody.appendChild(line);
+    scriptBody.scrollTop = scriptBody.scrollHeight;
 
-    while (captionLog.children.length > MAX_CAPTION_LINES) {
-      captionLog.removeChild(captionLog.firstChild);
+    while (scriptBody.querySelectorAll(".ss-line").length > MAX_CAPTION_LINES) {
+      const first = scriptBody.querySelector(".ss-line");
+      if (first) first.remove();
     }
   }
 
@@ -118,8 +78,8 @@
     if (captionObserver) return;
 
     captionHistory = [];
-    captionLog.innerHTML = "";
-    captionLive.textContent = "Waiting for captions…";
+    scriptBody.innerHTML = "";
+    scriptBody.appendChild(scriptWaiting);
     lastCaption = "";
 
     // --- Strategy 1: DOM-based (Netflix renders captions as styled spans) ---
@@ -176,7 +136,6 @@
           }
         }
 
-        // Watch for tracks added later
         tracks.addEventListener("addtrack", (e) => {
           const track = e.track;
           if (track.kind === "subtitles" || track.kind === "captions") {
@@ -189,7 +148,6 @@
 
     hookTextTracks();
 
-    // Poll for video elements and DOM captions as fallback
     captionObserver._pollInterval = setInterval(() => {
       processDomCaptions();
       hookTextTracks();
@@ -206,30 +164,18 @@
   }
 
   // ==========================================================
-  // Event Listeners
+  // Layout — Squeeze Page Left
   // ==========================================================
 
-  devBtn.addEventListener("click", () => {
-    devVisible = !devVisible;
-    devBtn.textContent = devVisible ? "HIDE DEV" : "SHOW DEV";
-    captionOverlay.style.display = devVisible ? "flex" : "none";
-  });
+  function enableSideBySide() {
+    document.documentElement.classList.add("ss-active");
+    scriptPanel.style.display = "flex";
+  }
 
-  copyImgBtn.addEventListener("click", () => {
-    const hideEls = [captionOverlay, devBtn, copyImgBtn];
-    hideEls.forEach(el => el.style.visibility = "hidden");
-
-    chrome.runtime.sendMessage({ type: "ss:screenshot" }, async (res) => {
-      hideEls.forEach(el => el.style.visibility = "");
-      if (res?.dataUrl) {
-        const resp = await fetch(res.dataUrl);
-        const blob = await resp.blob();
-        await navigator.clipboard.write([new ClipboardItem({ "image/png": blob })]);
-        copyImgBtn.textContent = "COPIED ✓";
-        setTimeout(() => { copyImgBtn.textContent = "COPY IMAGE TO CLIPBOARD"; }, 1500);
-      }
-    });
-  });
+  function disableSideBySide() {
+    document.documentElement.classList.remove("ss-active");
+    scriptPanel.style.display = "none";
+  }
 
   // ==========================================================
   // Lifecycle — Start / Stop
@@ -237,21 +183,13 @@
 
   function startLoop() {
     enabled = true;
-    devVisible = false;
-    devBtn.textContent = "SHOW DEV";
-    devBtn.style.display = "block";
-    copyImgBtn.style.display = "none";
-    captionOverlay.style.display = "none";
+    enableSideBySide();
     startCaptionObserver();
   }
 
   function stopLoop() {
     enabled = false;
-    devBtn.style.display = "none";
-    copyImgBtn.style.display = "none";
-    captionOverlay.style.display = "none";
-    scriptLabel.style.display = "none";
-    if (labelTimeout) { clearTimeout(labelTimeout); labelTimeout = null; }
+    disableSideBySide();
     stopCaptionObserver();
   }
 
