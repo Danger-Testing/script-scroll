@@ -3,7 +3,7 @@
 // ============================================================
 
 (() => {
-  const VERSION = "3.0.0";
+  const VERSION = "3.0.1";
   let enabled = false;
   let scriptLines = []; // [{ pageNum, text, norm, el }]
   let captionObserver = null;
