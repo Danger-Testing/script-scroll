@@ -49,8 +49,43 @@
       .trim();
   }
 
-  // ---- TODO: matching goes here ----
+  // ---- Find Match ----
+  // Two directions:
+  //   A) script line contains caption  → "Did you do your homework? Yeah." inside a long script line
+  //   B) caption contains script line  → script line "Did you do your homework?" inside caption "Did you do your homework? Yeah."
+  // Direction B is what every previous version missed entirely.
+  // Min length of 10 on the script line for direction B so short lines
+  // like "Yeah." or character names don't match everything.
   function findMatch(captionNorm, startIdx) {
+    if (!captionNorm || captionNorm.length < 3) return -1;
+
+    const total = scriptLines.length;
+    const LOOK_BEHIND = 30;
+    const lo = Math.max(0, startIdx - LOOK_BEHIND);
+
+    const matches = (i) => {
+      const ln = scriptLines[i].norm;
+      if (!ln) return false;
+      if (ln.includes(captionNorm)) return true;               // A
+      if (ln.length >= 10 && captionNorm.includes(ln)) return true; // B
+      return false;
+    };
+
+    // Forward from current position to end of script (no cap — always re-syncs)
+    for (let i = startIdx; i < total; i++) {
+      if (matches(i)) return i;
+      // Caption may span two adjacent PDF lines (wrapped dialogue)
+      if (i + 1 < total && scriptLines[i + 1].norm) {
+        const combined = scriptLines[i].norm + " " + scriptLines[i + 1].norm;
+        if (combined.includes(captionNorm) || (combined.length >= 10 && captionNorm.includes(combined))) return i;
+      }
+    }
+
+    // Small backward buffer for a line we briefly missed
+    for (let i = lo; i < startIdx; i++) {
+      if (matches(i)) return i;
+    }
+
     return -1;
   }
 
@@ -67,14 +102,31 @@
   // ---- Handle Caption ----
   function handleCaption(text) {
     if (!text || !scriptLines.length) return;
-    const norm = normalize(text);
-    const matchIdx = findMatch(norm, lastMatchIdx);
+
+    // Try full caption first
+    let matchIdx = findMatch(normalize(text), lastMatchIdx);
     if (matchIdx >= 0) {
       log(`Match line ${matchIdx}: "${scriptLines[matchIdx].text.substring(0, 60)}"`);
       highlightMatch(matchIdx);
-    } else {
-      log(`No match: "${text.substring(0, 50)}"`);
+      return;
     }
+
+    // Netflix sometimes merges two speakers into one caption:
+    // "Yes, it's called accountability. I'm not talking to you, bitch!"
+    // Split on sentence boundaries and try each fragment.
+    const fragments = text.split(/(?<=[.!?])\s+/).map(f => normalize(f)).filter(f => f.length >= 3);
+    if (fragments.length > 1) {
+      for (const frag of fragments) {
+        matchIdx = findMatch(frag, lastMatchIdx);
+        if (matchIdx >= 0) {
+          log(`Fragment match line ${matchIdx}: "${scriptLines[matchIdx].text.substring(0, 60)}"`);
+          highlightMatch(matchIdx);
+          return;
+        }
+      }
+    }
+
+    log(`No match: "${text.substring(0, 50)}"`);
   }
 
   // ---- Caption Extraction ----
