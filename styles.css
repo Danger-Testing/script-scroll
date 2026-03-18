@@ -70,38 +70,40 @@ html.ss-active body {
   opacity: 0.6;
 }
 
-/* Script Body (scrolling transcript) */
+/* Script Body (scrolling PDF pages) */
 #ss-body {
   flex: 1;
   overflow-y: auto;
-  padding: 40px 60px;
   display: none;
+  background: #e8e8e4;
 }
 
-/* Script Lines */
-.ss-line {
-  font-size: 13px;
-  line-height: 1.8;
-  color: #c0c0b8;
-  padding: 1px 0;
-  transition: color 0.3s ease, background 0.3s ease;
+/* PDF Page Container */
+.ss-page {
+  margin: 12px auto;
+  background: #fff;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.12);
+  overflow: hidden;
 }
 
-.ss-line-past {
-  color: #999;
+.ss-page canvas {
+  display: block;
 }
 
-.ss-line-active {
-  color: #1a1a1a;
-  font-weight: 700;
-  background: rgba(168, 85, 247, 0.08);
-  padding: 2px 8px;
-  margin: 0 -8px;
-  border-radius: 4px;
+/* Invisible anchor overlays for scroll targeting */
+.ss-anchor {
+  position: absolute;
+  left: 0;
+  right: 0;
+  pointer-events: none;
+  transition: background 0.3s ease;
+  border-radius: 2px;
 }
 
-.ss-line:not(.ss-line-active):not(.ss-line-past) {
-  color: #c0c0b8;
+/* Active line highlight on the PDF */
+.ss-anchor-active {
+  background: rgba(168, 85, 247, 0.18);
+  box-shadow: inset 3px 0 0 #a855f7;
 }
 
 /* Debug Log */
