@@ -8,24 +8,10 @@
   let captionObserver = null;
   let lastCaption = "";
   let lastMatchIdx = 0;
-  let missStreak = 0;
   let panel = null;
   let pdfLoaded = false;
   let trackListener = null;
   let debugLog = null;
-
-  // ---- Stopwords (ignored in matching) ----
-  const STOPWORDS = new Set([
-    "i", "me", "my", "you", "your", "he", "she", "it", "we", "they",
-    "a", "an", "the", "is", "are", "was", "were", "am", "be", "been",
-    "do", "does", "did", "have", "has", "had", "will", "would", "could",
-    "should", "can", "may", "might", "shall", "to", "of", "in", "for",
-    "on", "with", "at", "by", "from", "as", "into", "that", "this",
-    "but", "and", "or", "not", "no", "so", "if", "then", "than",
-    "up", "out", "just", "about", "what", "all", "when", "how",
-    "its", "his", "her", "our", "their", "him", "them", "us",
-    "there", "here", "very", "too", "also", "well", "oh", "um",
-  ]);
 
   // ---- Debug Logger ----
   function log(msg) {
@@ -56,91 +42,36 @@
     return str.toLowerCase().replace(/[^a-z0-9\s]/g, "").replace(/\s+/g, " ").trim();
   }
 
-  // ---- Tokenize (remove stopwords) ----
-  function tokenize(norm) {
-    return norm.split(" ").filter(w => w.length > 1 && !STOPWORDS.has(w));
-  }
+  // ---- Find Match (Ctrl+F style) ----
+  // Search ALL lines for the caption. Like Ctrl+F.
+  // Prefer the first match at or after lastMatchIdx.
+  // If none found forward, check behind (user may have rewound).
+  function findMatch(captionNorm, startIdx, lines) {
+    if (captionNorm.length < 3) return -1;
 
-  // ---- Score match between caption tokens and a line ----
-  function scoreMatch(captionTokens, lineNorm) {
-    if (!lineNorm || captionTokens.length === 0) return 0;
-    let hits = 0;
-    for (const w of captionTokens) {
-      if (lineNorm.includes(w)) hits++;
-    }
-    return hits / captionTokens.length;
-  }
-
-  // ---- Fuzzy Match (conservative, local-only) ----
-  function fuzzyMatch(captionNorm, startIdx, lines) {
-    const tokens = tokenize(captionNorm);
-
-    // Very short captions (after removing stopwords) — require exact substring
-    if (tokens.length < 2) {
-      // Try exact substring in a tiny window
-      const end = Math.min(startIdx + 8, lines.length);
-      for (let i = Math.max(0, startIdx - 2); i < end; i++) {
-        if (lines[i].norm.includes(captionNorm)) return i;
-      }
-      return -1;
-    }
-
-    // --- Local search: small window around current position ---
-    const localStart = Math.max(0, startIdx - 2);
-    const localEnd = Math.min(startIdx + 15, lines.length);
-    let bestIdx = -1;
-    let bestScore = 0;
-
-    for (let i = localStart; i < localEnd; i++) {
+    // Pass 1: search forward from current position — first substring hit wins
+    for (let i = startIdx; i < lines.length; i++) {
       const lineNorm = lines[i].norm;
       if (!lineNorm) continue;
-
-      // Exact substring match — immediate accept
       if (lineNorm.includes(captionNorm)) return i;
-
-      // Also check joining with next line (captions can span lines)
+      // Check combined with next line (captions can span two script lines)
       if (i + 1 < lines.length) {
         const combined = lineNorm + " " + lines[i + 1].norm;
         if (combined.includes(captionNorm)) return i;
       }
+    }
 
-      const score = scoreMatch(tokens, lineNorm);
-      if (score > bestScore) {
-        bestScore = score;
-        bestIdx = i;
+    // Pass 2: search from beginning (user might have rewound)
+    for (let i = 0; i < startIdx; i++) {
+      const lineNorm = lines[i].norm;
+      if (!lineNorm) continue;
+      if (lineNorm.includes(captionNorm)) return i;
+      if (i + 1 < lines.length) {
+        const combined = lineNorm + " " + lines[i + 1].norm;
+        if (combined.includes(captionNorm)) return i;
       }
     }
 
-    // High confidence local match — accept
-    if (bestScore >= 0.75) return bestIdx;
-
-    // --- Recovery mode: only after several consecutive misses ---
-    if (missStreak >= 4) {
-      const recoveryEnd = Math.min(startIdx + 60, lines.length);
-      let recBestIdx = -1;
-      let recBestScore = 0;
-
-      for (let i = localEnd; i < recoveryEnd; i++) {
-        const lineNorm = lines[i].norm;
-        if (!lineNorm) continue;
-
-        if (lineNorm.includes(captionNorm)) return i;
-
-        const score = scoreMatch(tokens, lineNorm);
-        if (score > recBestScore) {
-          recBestScore = score;
-          recBestIdx = i;
-        }
-      }
-
-      // Only jump on very high confidence recovery
-      if (recBestScore >= 0.9) {
-        log(`Recovery jump → line ${recBestIdx} (score ${recBestScore.toFixed(2)}, after ${missStreak} misses)`);
-        return recBestIdx;
-      }
-    }
-
-    // No confident match — stay put
     return -1;
   }
 
@@ -168,12 +99,10 @@
     if (norm === lastCaption || !norm) return;
     lastCaption = norm;
 
-    const matchIdx = fuzzyMatch(norm, lastMatchIdx, scriptLines);
+    const matchIdx = findMatch(norm, lastMatchIdx, scriptLines);
     if (matchIdx >= 0) {
+      log(`Caption matched → line ${matchIdx}: "${scriptLines[matchIdx].text.substring(0, 40)}…"`);
       highlightMatch(matchIdx);
-      missStreak = 0;
-    } else {
-      missStreak++;
     }
   }
 
@@ -287,7 +216,6 @@
     scriptLines = [];
     lastMatchIdx = 0;
     lastCaption = "";
-    missStreak = 0;
 
     const scale = 1.2;
 
