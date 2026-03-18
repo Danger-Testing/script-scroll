@@ -3,13 +3,15 @@
 // ============================================================
 
 (() => {
-  const VERSION = "2.0";
+  const VERSION = "2.3";
   let enabled = false;
   let scriptLines = []; // [{ pageNum, text, norm, sigTokens: Set, el }]
   let captionObserver = null;
   let lastCaption = "";
   let lastMatchIdx = 0;
   let synced = false; // false = search full script until first match
+  let consecutiveMisses = 0;
+  const RESYNC_AFTER = 4; // misses in a row before widening back to full-script search
   let panel = null;
   let pdfLoaded = false;
   let debugLog = null;
@@ -179,6 +181,7 @@
     scriptLines[idx].el.scrollIntoView({ behavior: "smooth", block: "center" });
     lastMatchIdx = idx;
     synced = true;
+    consecutiveMisses = 0;
   }
 
   // ---- Handle Caption ----
@@ -211,6 +214,15 @@
       }
     }
 
+    // Every miss inches us toward a full-script resync.
+    // After RESYNC_AFTER consecutive misses, drop the window constraint so the
+    // next caption searches the whole script and re-anchors wherever we are.
+    consecutiveMisses++;
+    if (consecutiveMisses >= RESYNC_AFTER) {
+      synced = false;
+      consecutiveMisses = 0;
+      log(`Lost sync — next caption will search full script`);
+    }
     log(`No match: "${text.substring(0, 50)}"`);
   }
 
@@ -346,6 +358,7 @@
     lastMatchIdx = 0;
     lastCaption = "";
     synced = false;
+    consecutiveMisses = 0;
 
     const scale = 1.2;
 
