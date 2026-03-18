@@ -11,8 +11,32 @@
   let lastMatchIdx = 0;
   let panel = null;
   let pdfLoaded = false;
-  let pdfjsReady = false;
   let trackListener = null;
+  let debugLog = null;
+
+  // ---- Debug Logger ----
+  function log(msg) {
+    console.log(`[Script Scroll] ${msg}`);
+    if (debugLog) {
+      const line = document.createElement("div");
+      line.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+      debugLog.appendChild(line);
+      debugLog.scrollTop = debugLog.scrollHeight;
+      while (debugLog.children.length > 50) debugLog.removeChild(debugLog.firstChild);
+    }
+  }
+
+  // ---- Init pdf.js ----
+  let pdfjsInitialized = false;
+  function getPdfJs() {
+    const lib = globalThis.pdfjsLib;
+    if (!lib) throw new Error("pdf.js not available in content script");
+    if (!pdfjsInitialized) {
+      lib.GlobalWorkerOptions.workerSrc = chrome.runtime.getURL("pdf.worker.min.js");
+      pdfjsInitialized = true;
+    }
+    return lib;
+  }
 
   // ---- Normalization ----
   function normalize(str) {
@@ -172,35 +196,14 @@
     }
   }
 
-  // ---- Load pdf.js ----
-  function loadPdfJs() {
-    return new Promise((resolve, reject) => {
-      if (pdfjsReady && typeof pdfjsLib !== "undefined") {
-        resolve();
-        return;
-      }
-
-      const script = document.createElement("script");
-      script.src = chrome.runtime.getURL("pdf.min.js");
-      script.onload = () => {
-        if (typeof pdfjsLib !== "undefined") {
-          pdfjsLib.GlobalWorkerOptions.workerSrc = chrome.runtime.getURL("pdf.worker.min.js");
-          pdfjsReady = true;
-          resolve();
-        } else {
-          reject(new Error("pdfjsLib not found after loading script"));
-        }
-      };
-      script.onerror = () => reject(new Error("Failed to load pdf.js"));
-      document.head.appendChild(script);
-    });
-  }
-
   // ---- Parse PDF ----
   async function parsePDF(arrayBuffer) {
-    await loadPdfJs();
+    log("Parsing PDF…");
+    const pdfjsLib = getPdfJs();
+    log(`pdf.js version: ${pdfjsLib.version}`);
 
     const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+    log(`PDF loaded: ${pdf.numPages} pages`);
     let fullText = "";
 
     for (let i = 1; i <= pdf.numPages; i++) {
@@ -208,8 +211,10 @@
       const content = await page.getTextContent();
       const pageText = content.items.map((item) => item.str).join(" ");
       fullText += pageText + "\n";
+      if (i % 20 === 0) log(`Parsed ${i}/${pdf.numPages} pages…`);
     }
 
+    log(`Done: ${fullText.length} chars total`);
     scriptText = fullText;
     return fullText;
   }
@@ -249,15 +254,25 @@
 
   // ---- Handle File Drop ----
   async function handleFileDrop(file) {
-    if (!file || file.type !== "application/pdf") {
-      console.warn("[Script Scroll] Not a PDF file");
+    log(`File dropped: "${file.name}" (${file.type}, ${(file.size / 1024).toFixed(0)} KB)`);
+
+    if (!file || !file.name.toLowerCase().endsWith(".pdf")) {
+      log("❌ Not a PDF file");
       return;
     }
 
-    const arrayBuffer = await file.arrayBuffer();
-    const text = await parsePDF(arrayBuffer);
-    renderScript(text);
-    startCaptionObservers();
+    try {
+      const arrayBuffer = await file.arrayBuffer();
+      log(`Read ${arrayBuffer.byteLength} bytes`);
+      const text = await parsePDF(arrayBuffer);
+      renderScript(text);
+      log(`Rendered ${scriptLines.length} lines`);
+      startCaptionObservers();
+      log("Caption observers started — ready for sync");
+    } catch (err) {
+      log(`❌ Error: ${err.message}`);
+      console.error("[Script Scroll]", err);
+    }
   }
 
   // ---- Build UI ----
@@ -324,10 +339,17 @@
     const body = document.createElement("div");
     body.id = "ss-body";
 
+    // Debug Log
+    debugLog = document.createElement("div");
+    debugLog.id = "ss-debug";
+
     panel.appendChild(header);
     panel.appendChild(dropZone);
     panel.appendChild(body);
+    panel.appendChild(debugLog);
     document.body.appendChild(panel);
+
+    log("UI built, pdf.js available: " + (typeof pdfjsLib !== "undefined"));
   }
 
   // ---- Start / Stop ----

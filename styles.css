@@ -103,3 +103,17 @@ html.ss-active body {
 .ss-line:not(.ss-line-active):not(.ss-line-past) {
   color: #c0c0b8;
 }
+
+/* Debug Log */
+#ss-debug {
+  flex-shrink: 0;
+  max-height: 120px;
+  overflow-y: auto;
+  background: #1a1a1a;
+  color: rgba(255, 255, 255, 0.6);
+  font-family: 'SF Mono', 'Menlo', 'Monaco', monospace;
+  font-size: 10px;
+  line-height: 1.6;
+  padding: 8px 12px;
+  border-top: 1px solid #333;
+}
