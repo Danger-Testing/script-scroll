@@ -3,6 +3,7 @@
 // ============================================================
 
 (() => {
+  const VERSION = "0.5";
   let enabled = false;
   let scriptLines = []; // [{ pageNum, text, norm, el }]
   let captionObserver = null;
@@ -340,7 +341,7 @@
     // Header
     const header = document.createElement("div");
     header.id = "ss-header";
-    header.textContent = "SCRIPT SCROLL";
+    header.textContent = `SCRIPT SCROLL v${VERSION}`;
 
     // Drop Zone
     const dropZone = document.createElement("div");
