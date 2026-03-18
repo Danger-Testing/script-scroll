@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Script Scroll",
-  "version": "1.0.0",
-  "description": "Live caption reader for Netflix and Peacock — displays subtitles in a dev overlay",
+  "version": "2.0.0",
+  "description": "Drop a screenplay PDF and auto-scroll along with live captions on Netflix and Peacock",
   "permissions": ["activeTab", "storage"],
   "background": {
     "service_worker": "background.js"
@@ -24,7 +24,7 @@
   },
   "web_accessible_resources": [
     {
-      "resources": ["interceptor.js"],
+      "resources": ["pdf.min.js", "pdf.worker.min.js"],
       "matches": ["https://www.netflix.com/*", "https://www.peacocktv.com/*"]
     }
   ]

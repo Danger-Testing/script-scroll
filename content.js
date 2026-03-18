@@ -1,370 +1,364 @@
 // ============================================================
-// Script Scroll — Content Script
+// Script Scroll — Content Script (PDF + Live Caption Matching)
 // ============================================================
 
 (() => {
-  // ==========================================================
-  // State
-  // ==========================================================
-
   let enabled = false;
+  let scriptText = "";
+  let scriptLines = []; // [{ text, el, norm }]
   let captionObserver = null;
   let lastCaption = "";
-  let fullScriptLoaded = false;
-  let allLines = []; // { startTime, endTime, text, el }
+  let lastMatchIdx = 0;
+  let panel = null;
+  let pdfLoaded = false;
+  let pdfjsReady = false;
+  let trackListener = null;
 
-  // ==========================================================
-  // Inject Fetch Interceptor into Page World
-  // ==========================================================
-
-  function injectInterceptor() {
-    const script = document.createElement("script");
-    script.src = chrome.runtime.getURL("interceptor.js");
-    script.onload = () => script.remove();
-    (document.head || document.documentElement).appendChild(script);
+  // ---- Normalization ----
+  function normalize(str) {
+    return str.toLowerCase().replace(/[^a-z0-9\s]/g, "").replace(/\s+/g, " ").trim();
   }
 
-  // Listen for intercepted subtitle data from page world
-  window.addEventListener("message", (event) => {
-    if (event.data?.type !== "ss:subtitles-intercepted") return;
-    if (fullScriptLoaded) return; // Already have a script loaded
-    parseTTML(event.data.data);
-  });
+  // ---- Fuzzy Match ----
+  function fuzzyMatch(captionNorm, startIdx, lines) {
+    const captionWords = captionNorm.split(" ").filter(Boolean);
+    if (captionWords.length === 0) return -1;
 
-  // ==========================================================
-  // UI Creation — Script Panel (right side)
-  // ==========================================================
+    const threshold = 0.6;
+    let bestIdx = -1;
+    let bestScore = 0;
 
-  const scriptPanel = document.createElement("div");
-  scriptPanel.id = "ss-panel";
+    // Search forward from startIdx in a window of 100 lines
+    const windowSize = 100;
+    let end = Math.min(startIdx + windowSize, lines.length);
 
-  const scriptHeader = document.createElement("div");
-  scriptHeader.id = "ss-header";
-  scriptHeader.textContent = "SCRIPT SCROLL";
+    for (let i = startIdx; i < end; i++) {
+      const lineNorm = lines[i].norm;
+      if (!lineNorm) continue;
 
-  const scriptBody = document.createElement("div");
-  scriptBody.id = "ss-body";
+      // Check substring match first
+      if (lineNorm.includes(captionNorm)) return i;
 
-  const scriptWaiting = document.createElement("div");
-  scriptWaiting.id = "ss-waiting";
-  scriptWaiting.textContent = "Waiting for subtitles…\nMake sure captions are enabled.";
-
-  scriptBody.appendChild(scriptWaiting);
-  scriptPanel.appendChild(scriptHeader);
-  scriptPanel.appendChild(scriptBody);
-
-  // ==========================================================
-  // Mount
-  // ==========================================================
-
-  document.documentElement.appendChild(scriptPanel);
-  scriptPanel.style.display = "none";
-
-  // ==========================================================
-  // TTML Parser
-  // ==========================================================
-
-  function parseTTML(xmlString) {
-    const parser = new DOMParser();
-    const doc = parser.parseFromString(xmlString, "text/xml");
-
-    // Find all <p> elements (each is a subtitle cue)
-    const pEls = doc.querySelectorAll("p");
-    if (pEls.length < 5) return; // Not a real subtitle file
-
-    const cues = [];
-    pEls.forEach(p => {
-      const begin = p.getAttribute("begin");
-      const end = p.getAttribute("end");
-      // Get text content, stripping inner tags like <span>, <br>
-      const text = p.textContent?.replace(/\s+/g, " ").trim();
-      if (!text || !begin) return;
-
-      cues.push({
-        startTime: parseTimestamp(begin),
-        endTime: end ? parseTimestamp(end) : null,
-        text: text,
-      });
-    });
-
-    if (cues.length < 5) return;
-
-    renderFullScript(cues);
-  }
-
-  function parseTimestamp(ts) {
-    // Handle formats like "00:01:23.456" or tick-based
-    if (ts.includes(":")) {
-      const parts = ts.split(":");
-      if (parts.length === 3) {
-        const h = parseFloat(parts[0]);
-        const m = parseFloat(parts[1]);
-        const s = parseFloat(parts[2]);
-        return h * 3600 + m * 60 + s;
+      // Word overlap
+      let hits = 0;
+      for (const w of captionWords) {
+        if (lineNorm.includes(w)) hits++;
+      }
+      const score = hits / captionWords.length;
+      if (score > bestScore) {
+        bestScore = score;
+        bestIdx = i;
       }
     }
-    // Tick-based format (ticks / 10000000)
-    const tickMatch = ts.match(/^(\d+)t$/);
-    if (tickMatch) return parseInt(tickMatch[1]) / 10000000;
-    return parseFloat(ts) || 0;
+
+    // If good match found in window, return it
+    if (bestScore >= threshold) return bestIdx;
+
+    // Expand search if nothing found in window
+    end = Math.min(startIdx + 500, lines.length);
+    for (let i = startIdx + windowSize; i < end; i++) {
+      const lineNorm = lines[i].norm;
+      if (!lineNorm) continue;
+
+      if (lineNorm.includes(captionNorm)) return i;
+
+      let hits = 0;
+      for (const w of captionWords) {
+        if (lineNorm.includes(w)) hits++;
+      }
+      const score = hits / captionWords.length;
+      if (score > bestScore) {
+        bestScore = score;
+        bestIdx = i;
+      }
+    }
+
+    return bestScore >= threshold ? bestIdx : -1;
   }
 
-  // ==========================================================
-  // Full Script Rendering
-  // ==========================================================
+  // ---- Highlight Match ----
+  function highlightMatch(idx) {
+    if (idx < 0 || idx >= scriptLines.length) return;
 
-  function renderFullScript(cues) {
-    scriptBody.innerHTML = "";
-    allLines = [];
-    fullScriptLoaded = true;
+    // Remove previous active
+    const prev = document.querySelector(".ss-line-active");
+    if (prev) prev.classList.remove("ss-line-active");
 
-    // Deduplicate consecutive identical lines
-    let prevText = "";
-    cues.forEach(cue => {
-      if (cue.text === prevText) return;
-      prevText = cue.text;
+    // Mark lines before as past
+    for (let i = lastMatchIdx; i < idx; i++) {
+      scriptLines[i].el.classList.add("ss-line-past");
+    }
 
-      const line = document.createElement("div");
-      line.className = "ss-line";
-      line.textContent = cue.text;
+    // Set active
+    scriptLines[idx].el.classList.add("ss-line-active");
+    scriptLines[idx].el.classList.remove("ss-line-past");
 
-      scriptBody.appendChild(line);
-      allLines.push({
-        startTime: cue.startTime,
-        endTime: cue.endTime,
-        text: cue.text,
-        el: line,
-      });
+    // Scroll into view
+    scriptLines[idx].el.scrollIntoView({ behavior: "smooth", block: "center" });
+
+    lastMatchIdx = idx;
+  }
+
+  // ---- Handle Caption ----
+  function handleCaption(text) {
+    if (!text || !scriptLines.length) return;
+    const norm = normalize(text);
+    if (norm === lastCaption || !norm) return;
+    lastCaption = norm;
+
+    const matchIdx = fuzzyMatch(norm, lastMatchIdx, scriptLines);
+    if (matchIdx >= 0) {
+      highlightMatch(matchIdx);
+    }
+  }
+
+  // ---- Caption Observers ----
+  function startCaptionObservers() {
+    // Netflix MutationObserver
+    const selectors = [
+      ".player-timedtext-text-container",
+      ".player-timedtext",
+      "[data-uia='player-timedtext']",
+    ];
+
+    captionObserver = new MutationObserver(() => {
+      for (const sel of selectors) {
+        const el = document.querySelector(sel);
+        if (el && el.textContent.trim()) {
+          handleCaption(el.textContent.trim());
+          return;
+        }
+      }
     });
 
-    scriptHeader.textContent = `SCRIPT SCROLL — ${allLines.length} lines`;
+    captionObserver.observe(document.body, {
+      childList: true,
+      subtree: true,
+      characterData: true,
+    });
 
-    // Start syncing with video time
-    startTimeSync();
-  }
+    // Peacock TextTrack API
+    trackListener = () => {
+      const video = document.querySelector("video");
+      if (!video) return;
+      for (const track of video.textTracks) {
+        if (track.mode === "showing" || track.mode === "hidden") {
+          track.addEventListener("cuechange", () => {
+            const cue = track.activeCues?.[0];
+            if (cue?.text) handleCaption(cue.text);
+          });
+        }
+      }
+    };
 
-  // ==========================================================
-  // Time Sync — Highlight Current Line
-  // ==========================================================
-
-  let syncRaf = null;
-
-  function startTimeSync() {
-    if (syncRaf) cancelAnimationFrame(syncRaf);
-
-    function tick() {
-      if (!enabled || !fullScriptLoaded) return;
-
+    // Check for video periodically until found
+    const videoCheck = setInterval(() => {
       const video = document.querySelector("video");
       if (video) {
-        const currentTime = video.currentTime;
-        let activeIdx = -1;
-
-        // Find the line that matches current time
-        for (let i = allLines.length - 1; i >= 0; i--) {
-          if (currentTime >= allLines[i].startTime) {
-            activeIdx = i;
-            break;
-          }
-        }
-
-        if (activeIdx >= 0) {
-          const activeLine = allLines[activeIdx];
-          if (!activeLine.el.classList.contains("ss-line-active")) {
-            // Clear previous active
-            const prev = scriptBody.querySelector(".ss-line-active");
-            if (prev) prev.classList.remove("ss-line-active");
-
-            // Mark all lines before as past
-            allLines.forEach((l, i) => {
-              if (i < activeIdx) l.el.classList.add("ss-line-past");
-              else l.el.classList.remove("ss-line-past");
-            });
-
-            // Highlight current
-            activeLine.el.classList.add("ss-line-active");
-            activeLine.el.scrollIntoView({ behavior: "smooth", block: "center" });
-          }
-        }
+        trackListener();
+        clearInterval(videoCheck);
       }
+    }, 2000);
 
-      syncRaf = requestAnimationFrame(tick);
-    }
-
-    syncRaf = requestAnimationFrame(tick);
+    // Store the interval so we can clear it on stop
+    captionObserver._videoCheck = videoCheck;
   }
 
-  function stopTimeSync() {
-    if (syncRaf) {
-      cancelAnimationFrame(syncRaf);
-      syncRaf = null;
-    }
-  }
-
-  // ==========================================================
-  // Realtime Fallback (DOM observer for when interception fails)
-  // ==========================================================
-
-  function startCaptionObserver() {
-    if (captionObserver) return;
-    lastCaption = "";
-
-    const findCaptionContainer = () => {
-      return document.querySelector(".player-timedtext-text-container")
-        || document.querySelector(".player-timedtext")
-        || document.querySelector("[data-uia='player-timedtext']");
-    };
-
-    const processDomCaptions = () => {
-      if (fullScriptLoaded) return; // Full script takes priority
-
-      const container = findCaptionContainer();
-      if (!container) return;
-
-      const spans = container.querySelectorAll("span");
-      const lines = [];
-      spans.forEach(s => {
-        const t = s.textContent.trim();
-        if (t) lines.push(t);
-      });
-
-      const captionText = lines.join(" ");
-      if (!captionText || captionText === lastCaption) return;
-      lastCaption = captionText;
-
-      // Remove waiting message
-      if (scriptWaiting.parentNode) scriptWaiting.remove();
-
-      // Clear previous active
-      const prev = scriptBody.querySelector(".ss-line-active");
-      if (prev) {
-        prev.classList.remove("ss-line-active");
-        prev.classList.add("ss-line-past");
-      }
-
-      const line = document.createElement("div");
-      line.className = "ss-line ss-line-active";
-      line.textContent = captionText;
-      scriptBody.appendChild(line);
-      line.scrollIntoView({ behavior: "smooth", block: "center" });
-
-      while (scriptBody.querySelectorAll(".ss-line").length > 500) {
-        const first = scriptBody.querySelector(".ss-line");
-        if (first) first.remove();
-      }
-    };
-
-    captionObserver = new MutationObserver(processDomCaptions);
-    const target = document.querySelector(".watch-video") || document.querySelector("[class*='player']") || document.body;
-    captionObserver.observe(target, { childList: true, subtree: true, characterData: true });
-
-    // TextTrack API fallback
-    const hookTextTracks = () => {
-      const videos = document.querySelectorAll("video");
-      videos.forEach(video => {
-        if (video._ssTracked) return;
-        video._ssTracked = true;
-
-        const tracks = video.textTracks;
-        if (!tracks) return;
-
-        const tryDumpCues = (track) => {
-          if (fullScriptLoaded) return;
-          if (track.cues && track.cues.length > 10) {
-            const cues = [];
-            for (let i = 0; i < track.cues.length; i++) {
-              cues.push({
-                startTime: track.cues[i].startTime,
-                endTime: track.cues[i].endTime,
-                text: track.cues[i].text?.replace(/<[^>]*>/g, "").trim(),
-              });
-            }
-            renderFullScript(cues);
-          }
-        };
-
-        for (let i = 0; i < tracks.length; i++) {
-          const track = tracks[i];
-          if (track.kind === "subtitles" || track.kind === "captions") {
-            track.mode = "showing";
-            tryDumpCues(track);
-          }
-        }
-
-        tracks.addEventListener("addtrack", (e) => {
-          const track = e.track;
-          if (track.kind === "subtitles" || track.kind === "captions") {
-            track.mode = "showing";
-            setTimeout(() => tryDumpCues(track), 1000);
-          }
-        });
-      });
-    };
-
-    hookTextTracks();
-
-    captionObserver._pollInterval = setInterval(() => {
-      if (!fullScriptLoaded) processDomCaptions();
-      hookTextTracks();
-    }, 500);
-  }
-
-  function stopCaptionObserver() {
+  function stopCaptionObservers() {
     if (captionObserver) {
+      if (captionObserver._videoCheck) clearInterval(captionObserver._videoCheck);
       captionObserver.disconnect();
-      if (captionObserver._pollInterval) clearInterval(captionObserver._pollInterval);
       captionObserver = null;
     }
-    document.querySelectorAll("video").forEach(v => { v._ssTracked = false; });
   }
 
-  // ==========================================================
-  // Layout
-  // ==========================================================
+  // ---- Load pdf.js ----
+  function loadPdfJs() {
+    return new Promise((resolve, reject) => {
+      if (pdfjsReady && typeof pdfjsLib !== "undefined") {
+        resolve();
+        return;
+      }
 
-  function enableSideBySide() {
-    document.documentElement.classList.add("ss-active");
-    scriptPanel.style.display = "flex";
+      const script = document.createElement("script");
+      script.src = chrome.runtime.getURL("pdf.min.js");
+      script.onload = () => {
+        if (typeof pdfjsLib !== "undefined") {
+          pdfjsLib.GlobalWorkerOptions.workerSrc = chrome.runtime.getURL("pdf.worker.min.js");
+          pdfjsReady = true;
+          resolve();
+        } else {
+          reject(new Error("pdfjsLib not found after loading script"));
+        }
+      };
+      script.onerror = () => reject(new Error("Failed to load pdf.js"));
+      document.head.appendChild(script);
+    });
   }
 
-  function disableSideBySide() {
-    document.documentElement.classList.remove("ss-active");
-    scriptPanel.style.display = "none";
+  // ---- Parse PDF ----
+  async function parsePDF(arrayBuffer) {
+    await loadPdfJs();
+
+    const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+    let fullText = "";
+
+    for (let i = 1; i <= pdf.numPages; i++) {
+      const page = await pdf.getPage(i);
+      const content = await page.getTextContent();
+      const pageText = content.items.map((item) => item.str).join(" ");
+      fullText += pageText + "\n";
+    }
+
+    scriptText = fullText;
+    return fullText;
   }
 
-  // ==========================================================
-  // Lifecycle
-  // ==========================================================
+  // ---- Render Script ----
+  function renderScript(text) {
+    const body = document.getElementById("ss-body");
+    body.innerHTML = "";
+    scriptLines = [];
+    lastMatchIdx = 0;
+    lastCaption = "";
 
-  function startLoop() {
+    const lines = text.split("\n");
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+
+      const div = document.createElement("div");
+      div.className = "ss-line";
+      div.textContent = trimmed;
+      body.appendChild(div);
+
+      scriptLines.push({
+        text: trimmed,
+        el: div,
+        norm: normalize(trimmed),
+      });
+    }
+
+    // Show body, hide drop zone
+    body.style.display = "block";
+    const dropZone = document.getElementById("ss-drop-zone");
+    if (dropZone) dropZone.style.display = "none";
+
+    pdfLoaded = true;
+  }
+
+  // ---- Handle File Drop ----
+  async function handleFileDrop(file) {
+    if (!file || file.type !== "application/pdf") {
+      console.warn("[Script Scroll] Not a PDF file");
+      return;
+    }
+
+    const arrayBuffer = await file.arrayBuffer();
+    const text = await parsePDF(arrayBuffer);
+    renderScript(text);
+    startCaptionObservers();
+  }
+
+  // ---- Build UI ----
+  function buildUI() {
+    if (panel) return;
+
+    panel = document.createElement("div");
+    panel.id = "ss-panel";
+
+    // Header
+    const header = document.createElement("div");
+    header.id = "ss-header";
+    header.textContent = "SCRIPT SCROLL";
+
+    // Drop Zone
+    const dropZone = document.createElement("div");
+    dropZone.id = "ss-drop-zone";
+
+    const icon = document.createElement("div");
+    icon.className = "ss-drop-icon";
+    icon.textContent = "📄";
+
+    const dropText = document.createElement("div");
+    dropText.className = "ss-drop-text";
+    dropText.textContent = "Drop screenplay PDF here";
+
+    const hint = document.createElement("div");
+    hint.className = "ss-drop-hint";
+    hint.textContent = "Supports any screenplay PDF format";
+
+    dropZone.appendChild(icon);
+    dropZone.appendChild(dropText);
+    dropZone.appendChild(hint);
+
+    // Drag and drop events
+    dropZone.addEventListener("dragover", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      dropZone.classList.add("ss-drag-over");
+    });
+
+    dropZone.addEventListener("dragenter", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      dropZone.classList.add("ss-drag-over");
+    });
+
+    dropZone.addEventListener("dragleave", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      dropZone.classList.remove("ss-drag-over");
+    });
+
+    dropZone.addEventListener("drop", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      dropZone.classList.remove("ss-drag-over");
+
+      const file = e.dataTransfer?.files?.[0];
+      if (file) handleFileDrop(file);
+    });
+
+    // Script Body
+    const body = document.createElement("div");
+    body.id = "ss-body";
+
+    panel.appendChild(header);
+    panel.appendChild(dropZone);
+    panel.appendChild(body);
+    document.body.appendChild(panel);
+  }
+
+  // ---- Start / Stop ----
+  function start() {
     enabled = true;
-    fullScriptLoaded = false;
-    allLines = [];
-    scriptBody.innerHTML = "";
-    scriptBody.appendChild(scriptWaiting);
-    scriptHeader.textContent = "SCRIPT SCROLL";
-    enableSideBySide();
-    injectInterceptor();
-    startCaptionObserver();
+    document.documentElement.classList.add("ss-active");
+    buildUI();
+    panel.style.display = "flex";
+
+    // If PDF was already loaded, just restart observers
+    if (pdfLoaded && scriptLines.length) {
+      document.getElementById("ss-drop-zone").style.display = "none";
+      document.getElementById("ss-body").style.display = "block";
+      startCaptionObservers();
+    }
   }
 
-  function stopLoop() {
+  function stop() {
     enabled = false;
-    fullScriptLoaded = false;
-    allLines = [];
-    disableSideBySide();
-    stopCaptionObserver();
-    stopTimeSync();
+    document.documentElement.classList.remove("ss-active");
+    if (panel) panel.style.display = "none";
+    stopCaptionObservers();
   }
 
-  // ==========================================================
-  // Message Listener
-  // ==========================================================
-
-  chrome.runtime.onMessage.addListener((message) => {
-    if (message?.type === "ss:toggle") {
-      if (message.enabled) startLoop();
-      else stopLoop();
+  // ---- Message Listener ----
+  chrome.runtime.onMessage.addListener((msg) => {
+    if (msg?.type !== "ss:toggle") return;
+    if (msg.enabled) {
+      start();
+    } else {
+      stop();
     }
   });
 })();
