@@ -3,7 +3,7 @@
 // ============================================================
 
 (() => {
-  const VERSION = "0.8";
+  const VERSION = "0.9";
   let enabled = false;
   let scriptLines = []; // [{ pageNum, text, norm, tokens, sigTokens, el }]
   let captionObserver = null;
@@ -187,23 +187,27 @@
         || document.querySelector("[class*='cue']");
     };
 
+    let captionDebounce = null;
     const processCaptions = () => {
       const container = findCaptionContainer();
       if (!container) return;
 
-      const spans = container.querySelectorAll("span");
-      const lines = [];
-      spans.forEach(s => {
-        const t = s.textContent.trim();
-        if (t) lines.push(t);
-      });
+      // Use textContent directly — querySelectorAll("span") picks up
+      // nested spans and duplicates text. Normalize whitespace/newlines.
+      const captionText = container.textContent.replace(/\s+/g, " ").trim();
+      if (!captionText || captionText === lastCaption) return;
 
-      const captionText = lines.join(" ");
-      if (captionText && captionText !== lastCaption) {
-        lastCaption = captionText;
-        log(`Caption: "${captionText}"`);
-        handleCaption(captionText);
-      }
+      // Debounce: Netflix renders lines sequentially, so wait 100ms
+      // for the full caption to appear before processing
+      if (captionDebounce) clearTimeout(captionDebounce);
+      captionDebounce = setTimeout(() => {
+        const text = container.textContent.replace(/\s+/g, " ").trim();
+        if (text && text !== lastCaption) {
+          lastCaption = text;
+          log(`Caption: "${text}"`);
+          handleCaption(text);
+        }
+      }, 100);
     };
 
     // MutationObserver on the player area
