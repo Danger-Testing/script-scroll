@@ -3,7 +3,7 @@
 // ============================================================
 
 (() => {
-  const VERSION = "0.6";
+  const VERSION = "0.7";
   let enabled = false;
   let scriptLines = []; // [{ pageNum, text, norm, el }]
   let captionObserver = null;
@@ -376,12 +376,14 @@
     buildUI();
     panel.style.display = "flex";
 
-    // If PDF was already loaded, just restart observers
+    // If PDF was already loaded, hide drop zone
     if (pdfLoaded && scriptLines.length) {
       document.getElementById("ss-drop-zone").style.display = "none";
       document.getElementById("ss-body").style.display = "block";
-      startCaptionObservers();
     }
+
+    // Always start caption observers immediately
+    startCaptionObservers();
   }
 
   function stop() {
