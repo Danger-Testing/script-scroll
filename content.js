@@ -3,7 +3,7 @@
 // ============================================================
 
 (() => {
-  const VERSION = "0.5";
+  const VERSION = "0.6";
   let enabled = false;
   let scriptLines = []; // [{ pageNum, text, norm, el }]
   let captionObserver = null;
@@ -96,8 +96,7 @@
   function handleCaption(text) {
     if (!text || !scriptLines.length) return;
     const norm = normalize(text);
-    if (norm === lastCaption || !norm) return;
-    lastCaption = norm;
+    if (!norm) return;
 
     const matchIdx = findMatch(norm, lastMatchIdx, scriptLines);
     if (matchIdx >= 0) {
@@ -106,18 +105,21 @@
     }
   }
 
-  // ---- Caption Observer (original dual-strategy from initial commit) ----
+  // ---- Caption Observer (from working Cortisol Maxxer commit aacc5ec) ----
   function startCaptionObservers() {
     if (captionObserver) return;
+    lastCaption = "";
 
-    // --- Strategy 1: DOM-based (Netflix renders captions as styled spans) ---
     const findCaptionContainer = () => {
       return document.querySelector(".player-timedtext-text-container")
         || document.querySelector(".player-timedtext")
-        || document.querySelector("[data-uia='player-timedtext']");
+        || document.querySelector("[data-uia='player-timedtext']")
+        || document.querySelector("[class*='subtitles']")
+        || document.querySelector("[class*='caption']")
+        || document.querySelector("[class*='cue']");
     };
 
-    const processDomCaptions = () => {
+    const processCaptions = () => {
       const container = findCaptionContainer();
       if (!container) return;
 
@@ -128,63 +130,23 @@
         if (t) lines.push(t);
       });
 
-      const text = lines.join(" ");
-      if (text) handleCaption(text);
+      const captionText = lines.join(" ");
+      if (captionText && captionText !== lastCaption) {
+        lastCaption = captionText;
+        log(`Caption: "${captionText}"`);
+        handleCaption(captionText);
+      }
     };
 
-    // MutationObserver scoped to the player, not document.body
-    captionObserver = new MutationObserver(processDomCaptions);
-    const target = document.querySelector(".watch-video")
-      || document.querySelector("[class*='player']")
-      || document.body;
+    // MutationObserver on the player area
+    captionObserver = new MutationObserver(processCaptions);
+    const target = document.querySelector(".watch-video") || document.body;
     captionObserver.observe(target, { childList: true, subtree: true, characterData: true });
 
-    // --- Strategy 2: TextTrack API (Peacock & other players with native cues) ---
-    const hookTextTracks = () => {
-      const videos = document.querySelectorAll("video");
-      videos.forEach(video => {
-        if (video._ssTracked) return;
-        video._ssTracked = true;
+    // Poll every 500ms as fallback
+    captionObserver._pollInterval = setInterval(processCaptions, 500);
 
-        const tracks = video.textTracks;
-        if (!tracks) return;
-
-        const onCueChange = (track) => {
-          if (!track.activeCues || track.activeCues.length === 0) return;
-          const lines = [];
-          for (let i = 0; i < track.activeCues.length; i++) {
-            const text = track.activeCues[i].text?.replace(/<[^>]*>/g, "").trim();
-            if (text) lines.push(text);
-          }
-          const joined = lines.join(" ");
-          if (joined) handleCaption(joined);
-        };
-
-        for (let i = 0; i < tracks.length; i++) {
-          const track = tracks[i];
-          if (track.kind === "subtitles" || track.kind === "captions") {
-            track.mode = "showing";
-            track.addEventListener("cuechange", () => onCueChange(track));
-          }
-        }
-
-        tracks.addEventListener("addtrack", (e) => {
-          const track = e.track;
-          if (track.kind === "subtitles" || track.kind === "captions") {
-            track.mode = "showing";
-            track.addEventListener("cuechange", () => onCueChange(track));
-          }
-        });
-      });
-    };
-
-    hookTextTracks();
-
-    // Poll every 500ms as fallback for both DOM captions and new video elements
-    captionObserver._pollInterval = setInterval(() => {
-      processDomCaptions();
-      hookTextTracks();
-    }, 500);
+    log("Caption observer started");
   }
 
   function stopCaptionObservers() {
@@ -193,7 +155,6 @@
       if (captionObserver._pollInterval) clearInterval(captionObserver._pollInterval);
       captionObserver = null;
     }
-    document.querySelectorAll("video").forEach(v => { v._ssTracked = false; });
   }
 
   // ---- Extract real lines from PDF text content ----
