@@ -3,15 +3,12 @@
 // ============================================================
 
 (() => {
-  const VERSION = "2.0.3";
+  const VERSION = "2.0.4";
   let enabled = false;
   let scriptLines = []; // [{ pageNum, text, norm, sigTokens: Set, el }]
   let captionObserver = null;
   let lastCaption = "";
   let lastMatchIdx = 0;
-  let synced = false; // false = search full script until first match
-  let consecutiveMisses = 0;
-  const RESYNC_AFTER = 4; // misses in a row before widening back to full-script search
   let panel = null;
   let pdfLoaded = false;
   let debugLog = null;
@@ -85,59 +82,54 @@
   }
 
   // ---- Find Match ----
-  // captionNorm: already-normalized caption text
-  // startIdx: last known position in scriptLines
+  // No artificial window cap. Always searches forward from startIdx to end
+  // of script so we naturally re-sync if we ever drift, no matter how far.
+  // A movie fires captions every 1-3 seconds — there's no time to "count
+  // misses". Just always look forward and find where we are.
   function findMatch(captionNorm, startIdx) {
     if (!captionNorm || captionNorm.length < 3) return -1;
 
     const total = scriptLines.length;
-
-    // Until we get the first successful match, search the whole script.
-    // After that, use a bounded window so we never jump to a wrong page.
-    const LOOK_AHEAD = synced ? 300 : total;
-    const LOOK_BEHIND = synced ? 60  : 0;
+    const LOOK_BEHIND = 30; // small backward buffer for a line we briefly missed
 
     const lo = Math.max(0, startIdx - LOOK_BEHIND);
-    const hi = Math.min(total, startIdx + LOOK_AHEAD);
 
     // ------------------------------------------------------------------
     // Pass 1: exact normalized substring
-    // Search forward from current position first (movie progresses forward).
+    // Forward from startIdx to end, then small backward buffer.
     // ------------------------------------------------------------------
-    for (let i = startIdx; i < hi; i++) {
+    for (let i = startIdx; i < total; i++) {
       const ln = scriptLines[i].norm;
       if (!ln) continue;
       if (ln.includes(captionNorm)) return i;
-      // A caption line may span two adjacent script lines (wrapped dialogue)
-      if (i + 1 < hi && scriptLines[i + 1].norm) {
+      // Caption may span two adjacent PDF lines (wrapped dialogue)
+      if (i + 1 < total && scriptLines[i + 1].norm) {
         if ((ln + " " + scriptLines[i + 1].norm).includes(captionNorm)) return i;
       }
     }
-    // Small backward search (in case we missed a line)
     for (let i = lo; i < startIdx; i++) {
       const ln = scriptLines[i].norm;
       if (ln && ln.includes(captionNorm)) return i;
     }
 
     const cutoff = Math.max(8, Math.floor(total * 0.05));
-    const capTokens = captionNorm.split(" ").filter(t => t.length >= 3 && !STOP_WORDS.has(t));
-    const capSig = [...new Set(capTokens.filter(t => (tokenLineFreq.get(t) || 0) <= cutoff))];
+    const capSig = [...new Set(
+      captionNorm.split(" ").filter(t =>
+        t.length >= 3 && !STOP_WORDS.has(t) && (tokenLineFreq.get(t) || 0) <= cutoff
+      )
+    )];
 
     // ------------------------------------------------------------------
     // Pass 2: anchor-word match
-    // If the caption contains a word that appears in only a handful of
-    // script lines (≤ 3), that word alone uniquely identifies the line —
-    // no threshold, no contractions needed.
-    // "accountability" appears once → find that line directly.
+    // A word appearing in ≤ 3 script lines uniquely identifies the line.
+    // Search forward from startIdx — still naturally re-syncs if drifted.
     // ------------------------------------------------------------------
-    const ANCHOR_MAX_FREQ = 3;
-    // Collect anchor words sorted rarest-first so we try the most unique word first
     const anchors = capSig
-      .filter(t => (tokenLineFreq.get(t) || 0) <= ANCHOR_MAX_FREQ)
+      .filter(t => (tokenLineFreq.get(t) || 0) <= 3)
       .sort((a, b) => (tokenLineFreq.get(a) || 0) - (tokenLineFreq.get(b) || 0));
 
     for (const anchor of anchors) {
-      for (let i = startIdx; i < hi; i++) {
+      for (let i = startIdx; i < total; i++) {
         if (scriptLines[i].sigTokens.has(anchor)) return i;
       }
       for (let i = lo; i < startIdx; i++) {
@@ -145,30 +137,43 @@
       }
     }
 
-    // ------------------------------------------------------------------
-    // Pass 3: fuzzy token match — fraction of caption's significant words
-    // found in the script line.
-    // ------------------------------------------------------------------
     if (capSig.length < 2) return -1;
 
+    // ------------------------------------------------------------------
+    // Pass 3a: hot zone — next 15 lines with relaxed threshold (40%)
+    // When watching live the next caption is almost always right here.
+    // ------------------------------------------------------------------
+    const hotEnd = Math.min(total, startIdx + 15);
     let bestIdx = -1, bestScore = 0;
-    const fuzzyLo = Math.max(0, startIdx - 10);
-    for (let i = fuzzyLo; i < hi; i++) {
+
+    for (let i = Math.max(lo, startIdx - 5); i < hotEnd; i++) {
       const lineSig = scriptLines[i].sigTokens;
       if (!lineSig || lineSig.size === 0) continue;
-
       let matches = 0;
-      for (const t of capSig) {
-        if (lineSig.has(t)) matches++;
-      }
+      for (const t of capSig) if (lineSig.has(t)) matches++;
       const score = matches / capSig.length;
-
       if (score >= 0.9) return i;
       if (score > bestScore) { bestScore = score; bestIdx = i; }
     }
+    if (bestScore >= 0.4 && bestIdx >= 0) return bestIdx;
 
+    // ------------------------------------------------------------------
+    // Pass 3b: full forward search with normal threshold (55%)
+    // Handles re-sync after any amount of drift.
+    // ------------------------------------------------------------------
+    bestIdx = -1; bestScore = 0;
+    for (let i = startIdx; i < total; i++) {
+      const lineSig = scriptLines[i].sigTokens;
+      if (!lineSig || lineSig.size === 0) continue;
+      let matches = 0;
+      for (const t of capSig) if (lineSig.has(t)) matches++;
+      const score = matches / capSig.length;
+      if (score >= 0.9) return i;
+      if (score > bestScore) { bestScore = score; bestIdx = i; }
+    }
     const threshold = capSig.length <= 3 ? 0.67 : 0.55;
     if (bestScore >= threshold && bestIdx >= 0) return bestIdx;
+
     return -1;
   }
 
@@ -180,8 +185,6 @@
     scriptLines[idx].el.classList.add("ss-anchor-active");
     scriptLines[idx].el.scrollIntoView({ behavior: "smooth", block: "center" });
     lastMatchIdx = idx;
-    synced = true;
-    consecutiveMisses = 0;
   }
 
   // ---- Handle Caption ----
@@ -214,15 +217,6 @@
       }
     }
 
-    // Every miss inches us toward a full-script resync.
-    // After RESYNC_AFTER consecutive misses, drop the window constraint so the
-    // next caption searches the whole script and re-anchors wherever we are.
-    consecutiveMisses++;
-    if (consecutiveMisses >= RESYNC_AFTER) {
-      synced = false;
-      consecutiveMisses = 0;
-      log(`Lost sync — next caption will search full script`);
-    }
     log(`No match: "${text.substring(0, 50)}"`);
   }
 
@@ -357,8 +351,6 @@
     scriptLines = [];
     lastMatchIdx = 0;
     lastCaption = "";
-    synced = false;
-    consecutiveMisses = 0;
 
     const scale = 1.2;
 
