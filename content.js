@@ -3,12 +3,11 @@
 // ============================================================
 
 (() => {
-  const VERSION = "3.0.1";
+  const VERSION = "3.0.2";
   let enabled = false;
   let scriptLines = []; // [{ pageNum, text, norm, el }]
   let captionObserver = null;
   let lastCaption = "";
-  let lastMatchIdx = 0;
   let panel = null;
   let pdfLoaded = false;
   let debugLog = null;
@@ -47,86 +46,6 @@
       .replace(/[^a-z0-9]+/g, " ")
       .replace(/\s+/g, " ")
       .trim();
-  }
-
-  // ---- Find Match ----
-  // Two directions:
-  //   A) script line contains caption  → "Did you do your homework? Yeah." inside a long script line
-  //   B) caption contains script line  → script line "Did you do your homework?" inside caption "Did you do your homework? Yeah."
-  // Direction B is what every previous version missed entirely.
-  // Min length of 10 on the script line for direction B so short lines
-  // like "Yeah." or character names don't match everything.
-  function findMatch(captionNorm, startIdx) {
-    if (!captionNorm || captionNorm.length < 3) return -1;
-
-    const total = scriptLines.length;
-    const LOOK_BEHIND = 30;
-    const lo = Math.max(0, startIdx - LOOK_BEHIND);
-
-    const matches = (i) => {
-      const ln = scriptLines[i].norm;
-      if (!ln) return false;
-      if (ln.includes(captionNorm)) return true;               // A
-      if (ln.length >= 10 && captionNorm.includes(ln)) return true; // B
-      return false;
-    };
-
-    // Forward from current position to end of script (no cap — always re-syncs)
-    for (let i = startIdx; i < total; i++) {
-      if (matches(i)) return i;
-      // Caption may span two adjacent PDF lines (wrapped dialogue)
-      if (i + 1 < total && scriptLines[i + 1].norm) {
-        const combined = scriptLines[i].norm + " " + scriptLines[i + 1].norm;
-        if (combined.includes(captionNorm) || (combined.length >= 10 && captionNorm.includes(combined))) return i;
-      }
-    }
-
-    // Small backward buffer for a line we briefly missed
-    for (let i = lo; i < startIdx; i++) {
-      if (matches(i)) return i;
-    }
-
-    return -1;
-  }
-
-  // ---- Highlight + Scroll ----
-  function highlightMatch(idx) {
-    if (idx < 0 || idx >= scriptLines.length) return;
-    const prev = document.querySelector(".ss-anchor-active");
-    if (prev) prev.classList.remove("ss-anchor-active");
-    scriptLines[idx].el.classList.add("ss-anchor-active");
-    scriptLines[idx].el.scrollIntoView({ behavior: "smooth", block: "center" });
-    lastMatchIdx = idx;
-  }
-
-  // ---- Handle Caption ----
-  function handleCaption(text) {
-    if (!text || !scriptLines.length) return;
-
-    // Try full caption first
-    let matchIdx = findMatch(normalize(text), lastMatchIdx);
-    if (matchIdx >= 0) {
-      log(`Match line ${matchIdx}: "${scriptLines[matchIdx].text.substring(0, 60)}"`);
-      highlightMatch(matchIdx);
-      return;
-    }
-
-    // Netflix sometimes merges two speakers into one caption:
-    // "Yes, it's called accountability. I'm not talking to you, bitch!"
-    // Split on sentence boundaries and try each fragment.
-    const fragments = text.split(/(?<=[.!?])\s+/).map(f => normalize(f)).filter(f => f.length >= 3);
-    if (fragments.length > 1) {
-      for (const frag of fragments) {
-        matchIdx = findMatch(frag, lastMatchIdx);
-        if (matchIdx >= 0) {
-          log(`Fragment match line ${matchIdx}: "${scriptLines[matchIdx].text.substring(0, 60)}"`);
-          highlightMatch(matchIdx);
-          return;
-        }
-      }
-    }
-
-    log(`No match: "${text.substring(0, 50)}"`);
   }
 
   // ---- Caption Extraction ----
@@ -180,7 +99,6 @@
         if (settled && settled !== lastCaption) {
           lastCaption = settled;
           log(`Caption: "${settled}"`);
-          handleCaption(settled);
         }
       }, 120);
     };
@@ -243,7 +161,6 @@
     const body = document.getElementById("ss-body");
     body.innerHTML = "";
     scriptLines = [];
-    lastMatchIdx = 0;
     lastCaption = "";
 
     const scale = 1.2;
