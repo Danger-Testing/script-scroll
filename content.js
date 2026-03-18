@@ -10,7 +10,6 @@
   let lastMatchIdx = 0;
   let panel = null;
   let pdfLoaded = false;
-  let trackListener = null;
   let debugLog = null;
 
   // ---- Debug Logger ----
@@ -106,63 +105,94 @@
     }
   }
 
-  // ---- Caption Observers ----
+  // ---- Caption Observer (original dual-strategy from initial commit) ----
   function startCaptionObservers() {
-    // Netflix MutationObserver
-    const selectors = [
-      ".player-timedtext-text-container",
-      ".player-timedtext",
-      "[data-uia='player-timedtext']",
-    ];
+    if (captionObserver) return;
 
-    captionObserver = new MutationObserver(() => {
-      for (const sel of selectors) {
-        const el = document.querySelector(sel);
-        if (el && el.textContent.trim()) {
-          handleCaption(el.textContent.trim());
-          return;
-        }
-      }
-    });
-
-    captionObserver.observe(document.body, {
-      childList: true,
-      subtree: true,
-      characterData: true,
-    });
-
-    // Peacock TextTrack API
-    trackListener = () => {
-      const video = document.querySelector("video");
-      if (!video) return;
-      for (const track of video.textTracks) {
-        if (track.mode === "showing" || track.mode === "hidden") {
-          track.addEventListener("cuechange", () => {
-            const cue = track.activeCues?.[0];
-            if (cue?.text) handleCaption(cue.text);
-          });
-        }
-      }
+    // --- Strategy 1: DOM-based (Netflix renders captions as styled spans) ---
+    const findCaptionContainer = () => {
+      return document.querySelector(".player-timedtext-text-container")
+        || document.querySelector(".player-timedtext")
+        || document.querySelector("[data-uia='player-timedtext']");
     };
 
-    // Check for video periodically until found
-    const videoCheck = setInterval(() => {
-      const video = document.querySelector("video");
-      if (video) {
-        trackListener();
-        clearInterval(videoCheck);
-      }
-    }, 2000);
+    const processDomCaptions = () => {
+      const container = findCaptionContainer();
+      if (!container) return;
 
-    captionObserver._videoCheck = videoCheck;
+      const spans = container.querySelectorAll("span");
+      const lines = [];
+      spans.forEach(s => {
+        const t = s.textContent.trim();
+        if (t) lines.push(t);
+      });
+
+      const text = lines.join(" ");
+      if (text) handleCaption(text);
+    };
+
+    // MutationObserver scoped to the player, not document.body
+    captionObserver = new MutationObserver(processDomCaptions);
+    const target = document.querySelector(".watch-video")
+      || document.querySelector("[class*='player']")
+      || document.body;
+    captionObserver.observe(target, { childList: true, subtree: true, characterData: true });
+
+    // --- Strategy 2: TextTrack API (Peacock & other players with native cues) ---
+    const hookTextTracks = () => {
+      const videos = document.querySelectorAll("video");
+      videos.forEach(video => {
+        if (video._ssTracked) return;
+        video._ssTracked = true;
+
+        const tracks = video.textTracks;
+        if (!tracks) return;
+
+        const onCueChange = (track) => {
+          if (!track.activeCues || track.activeCues.length === 0) return;
+          const lines = [];
+          for (let i = 0; i < track.activeCues.length; i++) {
+            const text = track.activeCues[i].text?.replace(/<[^>]*>/g, "").trim();
+            if (text) lines.push(text);
+          }
+          const joined = lines.join(" ");
+          if (joined) handleCaption(joined);
+        };
+
+        for (let i = 0; i < tracks.length; i++) {
+          const track = tracks[i];
+          if (track.kind === "subtitles" || track.kind === "captions") {
+            track.mode = "showing";
+            track.addEventListener("cuechange", () => onCueChange(track));
+          }
+        }
+
+        tracks.addEventListener("addtrack", (e) => {
+          const track = e.track;
+          if (track.kind === "subtitles" || track.kind === "captions") {
+            track.mode = "showing";
+            track.addEventListener("cuechange", () => onCueChange(track));
+          }
+        });
+      });
+    };
+
+    hookTextTracks();
+
+    // Poll every 500ms as fallback for both DOM captions and new video elements
+    captionObserver._pollInterval = setInterval(() => {
+      processDomCaptions();
+      hookTextTracks();
+    }, 500);
   }
 
   function stopCaptionObservers() {
     if (captionObserver) {
-      if (captionObserver._videoCheck) clearInterval(captionObserver._videoCheck);
       captionObserver.disconnect();
+      if (captionObserver._pollInterval) clearInterval(captionObserver._pollInterval);
       captionObserver = null;
     }
+    document.querySelectorAll("video").forEach(v => { v._ssTracked = false; });
   }
 
   // ---- Extract real lines from PDF text content ----
