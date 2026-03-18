@@ -3,15 +3,24 @@
 // ============================================================
 
 (() => {
-  const VERSION = "0.7";
+  const VERSION = "0.8";
   let enabled = false;
-  let scriptLines = []; // [{ pageNum, text, norm, el }]
+  let scriptLines = []; // [{ pageNum, text, norm, tokens, sigTokens, el }]
   let captionObserver = null;
   let lastCaption = "";
   let lastMatchIdx = 0;
   let panel = null;
   let pdfLoaded = false;
   let debugLog = null;
+  let tokenLineFreq = new Map();
+
+  const STOP_WORDS = new Set([
+    "a","an","and","are","as","at","be","been","but","by","do","did","for","from",
+    "get","got","had","has","have","he","her","him","his","i","if","in","into",
+    "is","it","its","just","me","my","no","not","of","oh","ok","okay","on","or",
+    "our","out","she","so","that","the","their","them","there","they","this","to",
+    "uh","um","up","was","we","well","were","what","yeah","yes","you","your",
+  ]);
 
   // ---- Debug Logger ----
   function log(msg) {
@@ -38,38 +47,99 @@
   }
 
   // ---- Normalization ----
+  // Punctuation → spaces (not nothing!) so "your..wardrobe" → "your wardrobe"
   function normalize(str) {
-    return str.toLowerCase().replace(/[^a-z0-9\s]/g, "").replace(/\s+/g, " ").trim();
+    return str.toLowerCase()
+      .replace(/['']/g, "")
+      .replace(/[^a-z0-9]+/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
   }
 
-  // ---- Find Match (Ctrl+F style) ----
-  // Search ALL lines for the caption. Like Ctrl+F.
-  // Prefer the first match at or after lastMatchIdx.
-  // If none found forward, check behind (user may have rewound).
-  function findMatch(captionNorm, startIdx, lines) {
+  // ---- Token helpers ----
+  function isSignificant(tok) {
+    return tok.length >= 3 && !STOP_WORDS.has(tok);
+  }
+
+  function buildTokenStats() {
+    tokenLineFreq = new Map();
+    for (const line of scriptLines) {
+      line.tokens = line.norm ? line.norm.split(" ").filter(Boolean) : [];
+      const unique = new Set(line.tokens);
+      for (const tok of unique) {
+        tokenLineFreq.set(tok, (tokenLineFreq.get(tok) || 0) + 1);
+      }
+    }
+    const cutoff = Math.max(8, Math.floor(scriptLines.length * 0.05));
+    for (const line of scriptLines) {
+      line.sigTokens = line.tokens.filter(t => isSignificant(t) && (tokenLineFreq.get(t) || 0) <= cutoff);
+    }
+  }
+
+  // Count how many tokens from needle appear in order in haystack
+  function orderedMatchCount(needle, haystack) {
+    let j = 0, matched = 0;
+    for (const tok of needle) {
+      while (j < haystack.length && haystack[j] !== tok) j++;
+      if (j < haystack.length) { matched++; j++; }
+    }
+    return matched;
+  }
+
+  // ---- Find Match ----
+  // Pass 1: exact substring (Ctrl+F). Pass 2: fuzzy token match.
+  function findMatch(captionText, startIdx, lines) {
+    const captionNorm = normalize(captionText);
     if (captionNorm.length < 3) return -1;
 
-    // Pass 1: search forward from current position — first substring hit wins
-    for (let i = startIdx; i < lines.length; i++) {
-      const lineNorm = lines[i].norm;
-      if (!lineNorm) continue;
-      if (lineNorm.includes(captionNorm)) return i;
-      // Check combined with next line (captions can span two script lines)
-      if (i + 1 < lines.length) {
-        const combined = lineNorm + " " + lines[i + 1].norm;
-        if (combined.includes(captionNorm)) return i;
+    const captionTokens = captionNorm.split(" ").filter(Boolean);
+    const captionSig = captionTokens.filter(t => isSignificant(t) && (tokenLineFreq.get(t) || 0) <= Math.max(8, Math.floor(lines.length * 0.05)));
+
+    // Build search ranges: forward from current, then rest, then behind (rewind)
+    const ranges = [
+      [startIdx, Math.min(lines.length, startIdx + 150)],
+      [Math.min(lines.length, startIdx + 150), lines.length],
+      [0, startIdx],
+    ].filter(([a, b]) => a < b);
+
+    // Pass 1: exact normalized substring match
+    for (const [from, to] of ranges) {
+      for (let i = from; i < to; i++) {
+        const ln = lines[i].norm;
+        if (!ln) continue;
+        if (ln.includes(captionNorm)) return i;
+        if (i + 1 < lines.length && (ln + " " + lines[i + 1].norm).includes(captionNorm)) return i;
       }
     }
 
-    // Pass 2: search from beginning (user might have rewound)
-    for (let i = 0; i < startIdx; i++) {
-      const lineNorm = lines[i].norm;
-      if (!lineNorm) continue;
-      if (lineNorm.includes(captionNorm)) return i;
-      if (i + 1 < lines.length) {
-        const combined = lineNorm + " " + lines[i + 1].norm;
-        if (combined.includes(captionNorm)) return i;
+    // Pass 2: fuzzy token match (need at least 2 significant words)
+    if (captionSig.length < 2) return -1;
+
+    for (const [from, to] of ranges) {
+      let bestIdx = -1, bestScore = 0;
+
+      for (let i = from; i < to; i++) {
+        const lineSig = lines[i].sigTokens;
+        if (!lineSig || !lineSig.length) continue;
+
+        // Combine with next line (caption can span two script lines)
+        const combined = i + 1 < lines.length ? lineSig.concat(lines[i + 1].sigTokens) : lineSig;
+        const ordered = orderedMatchCount(captionSig, combined);
+        if (ordered < 2) continue;
+
+        const coverage = ordered / captionSig.length;
+        if (coverage > bestScore) {
+          bestScore = coverage;
+          bestIdx = i;
+        }
+
+        // Strong match — take it immediately
+        if (coverage >= 0.9) return i;
       }
+
+      // Accept if enough words matched in order
+      const needed = captionSig.length <= 3 ? 0.65 : 0.55;
+      if (bestScore >= needed && bestIdx >= 0) return bestIdx;
     }
 
     return -1;
@@ -95,12 +165,10 @@
   // ---- Handle Caption ----
   function handleCaption(text) {
     if (!text || !scriptLines.length) return;
-    const norm = normalize(text);
-    if (!norm) return;
 
-    const matchIdx = findMatch(norm, lastMatchIdx, scriptLines);
+    const matchIdx = findMatch(text, lastMatchIdx, scriptLines);
     if (matchIdx >= 0) {
-      log(`Caption matched → line ${matchIdx}: "${scriptLines[matchIdx].text.substring(0, 40)}…"`);
+      log(`Matched → line ${matchIdx}: "${scriptLines[matchIdx].text.substring(0, 50)}…"`);
       highlightMatch(matchIdx);
     }
   }
@@ -261,6 +329,7 @@
       if (pageNum % 10 === 0) log(`Rendered ${pageNum}/${pdf.numPages} pages…`);
     }
 
+    buildTokenStats();
     log(`Done: ${scriptLines.length} lines across ${pdf.numPages} pages`);
 
     // Show body, hide drop zone
