@@ -3,7 +3,7 @@
 // ============================================================
 
 (() => {
-  const VERSION = "0.9";
+  const VERSION = "1.0";
   let enabled = false;
   let scriptLines = []; // [{ pageNum, text, norm, tokens, sigTokens, el }]
   let captionObserver = null;
@@ -112,8 +112,9 @@
       }
     }
 
-    // Pass 2: fuzzy token match (need at least 2 significant words)
-    if (captionSig.length < 2) return -1;
+    // Pass 2: fuzzy token match (need at least 2 unique significant words)
+    const uniqueSig = [...new Set(captionSig)];
+    if (uniqueSig.length < 2) return -1;
 
     for (const [from, to] of ranges) {
       let bestIdx = -1, bestScore = 0;
@@ -124,10 +125,10 @@
 
         // Combine with next line (caption can span two script lines)
         const combined = i + 1 < lines.length ? lineSig.concat(lines[i + 1].sigTokens) : lineSig;
-        const ordered = orderedMatchCount(captionSig, combined);
+        const ordered = orderedMatchCount(uniqueSig, combined);
         if (ordered < 2) continue;
 
-        const coverage = ordered / captionSig.length;
+        const coverage = ordered / uniqueSig.length;
         if (coverage > bestScore) {
           bestScore = coverage;
           bestIdx = i;
@@ -138,7 +139,7 @@
       }
 
       // Accept if enough words matched in order
-      const needed = captionSig.length <= 3 ? 0.65 : 0.55;
+      const needed = uniqueSig.length <= 3 ? 0.65 : 0.55;
       if (bestScore >= needed && bestIdx >= 0) return bestIdx;
     }
 
@@ -187,27 +188,41 @@
         || document.querySelector("[class*='cue']");
     };
 
+    // Extract caption text from Netflix DOM without duplication.
+    // Netflix nests spans: <span><span>text</span></span>
+    // Only read leaf spans (those with no child spans) to avoid doubling.
+    function extractCaptionText(container) {
+      const allSpans = container.querySelectorAll("span");
+      const leaves = [];
+      allSpans.forEach(s => {
+        if (s.querySelector("span")) return; // skip parents
+        const t = s.textContent.trim();
+        if (t) leaves.push(t);
+      });
+      if (leaves.length > 0) return leaves.join(" ");
+      // Fallback if no spans at all
+      return container.textContent.replace(/\s+/g, " ").trim();
+    }
+
     let captionDebounce = null;
     const processCaptions = () => {
       const container = findCaptionContainer();
       if (!container) return;
 
-      // Use textContent directly — querySelectorAll("span") picks up
-      // nested spans and duplicates text. Normalize whitespace/newlines.
-      const captionText = container.textContent.replace(/\s+/g, " ").trim();
-      if (!captionText || captionText === lastCaption) return;
+      const raw = extractCaptionText(container);
+      if (!raw || raw === lastCaption) return;
 
-      // Debounce: Netflix renders lines sequentially, so wait 100ms
+      // Debounce: Netflix renders lines sequentially, wait 150ms
       // for the full caption to appear before processing
       if (captionDebounce) clearTimeout(captionDebounce);
       captionDebounce = setTimeout(() => {
-        const text = container.textContent.replace(/\s+/g, " ").trim();
+        const text = extractCaptionText(container);
         if (text && text !== lastCaption) {
           lastCaption = text;
           log(`Caption: "${text}"`);
           handleCaption(text);
         }
-      }, 100);
+      }, 150);
     };
 
     // MutationObserver on the player area
